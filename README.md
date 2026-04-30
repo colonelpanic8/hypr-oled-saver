@@ -1,8 +1,8 @@
 # hypr-oled-saver
 
 `hypr-oled-saver` is a small OLED-friendly layer-shell screensaver for Hyprland.
-It renders mostly black surfaces, a dim drifting clock, and sparse moving
-window glyphs derived from the currently visible Hyprland workspaces.
+It renders mostly black surfaces, a dim drifting clock, and moving window glyphs
+derived from the open Hyprland clients across workspaces.
 
 This is an idle visual, not a lock screen. Use `hyprlock` for locking.
 
@@ -44,5 +44,8 @@ listener {
 
 - Uses `gtk-layer-shell` to cover each monitor with an overlay-layer surface.
 - Queries `hyprctl -j monitors` and `hyprctl -j clients`.
+- A standalone Wayland layer-shell client can render Hyprland window metadata, but
+  it cannot render real window contents from inactive workspaces. Real live
+  thumbnails require a compositor-side Hyprland plugin/render-pass design.
 - Falls back to synthetic particles outside Hyprland.
 - Keeps brightness low by design; the default background is pure black.

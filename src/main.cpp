@@ -34,6 +34,7 @@ struct Rect {
 };
 
 struct MonitorInfo {
+    int id = -1;
     std::string name;
     Rect geometry;
     int activeWorkspaceId = 0;
@@ -44,6 +45,7 @@ struct ClientInfo {
     std::string className;
     std::string title;
     std::string monitorName;
+    int monitorId = -1;
     int workspaceId = 0;
     Rect geometry;
     bool mapped = true;
@@ -58,6 +60,10 @@ struct Particle {
     double h = 12;
     double vx = 12;
     double vy = 9;
+    double minX = 0;
+    double minY = 0;
+    double maxX = 0;
+    double maxY = 0;
     double red = 0.20;
     double green = 0.42;
     double blue = 0.54;
@@ -71,6 +77,7 @@ struct SurfaceState {
     Rect hyprGeometry;
     std::vector<Particle> particles;
     gint64 lastFrameUs = 0;
+    bool hasRealParticleLayout = false;
 };
 
 std::vector<std::unique_ptr<SurfaceState>> g_surfaces;
@@ -157,6 +164,7 @@ std::vector<MonitorInfo> loadMonitors() {
 
     for (const auto &item : *monitors) {
         MonitorInfo monitor;
+        monitor.id = jsonInt(item, "id", -1);
         monitor.name = jsonString(item, "name");
         monitor.geometry.x = jsonInt(item, "x");
         monitor.geometry.y = jsonInt(item, "y");
@@ -184,8 +192,14 @@ std::vector<ClientInfo> loadClients() {
         client.key = jsonString(item, "address");
         client.className = jsonString(item, "class");
         client.title = jsonString(item, "title");
-        client.monitorName = jsonString(item, "monitor");
         client.geometry = jsonRectFromArrays(item);
+
+        if (item.contains("monitor")) {
+            if (item.at("monitor").is_number_integer())
+                client.monitorId = item.at("monitor").get<int>();
+            else if (item.at("monitor").is_string())
+                client.monitorName = item.at("monitor").get<std::string>();
+        }
 
         if (item.contains("workspace") && item.at("workspace").is_object())
             client.workspaceId = jsonInt(item.at("workspace"), "id");
@@ -238,13 +252,18 @@ Particle particleFromClient(const ClientInfo &client, const MonitorInfo &monitor
 
     Particle particle;
     particle.key = client.key;
-    particle.w = clamp(42.0 + areaScale * 210.0 * std::sqrt(aspect), 36.0, 180.0);
-    particle.h = clamp(particle.w / aspect, 24.0, 112.0);
-    particle.x = clamp(relX * width, 0.0, std::max(0.0, width - particle.w));
-    particle.y = clamp(relY * height, 0.0, std::max(0.0, height - particle.h));
+    particle.w = clamp(170.0 + areaScale * 260.0 * std::sqrt(aspect), 160.0, 420.0);
+    particle.h = clamp(particle.w / aspect, 96.0, 260.0);
+    const double geometryWeight = client.workspaceId == monitor.activeWorkspaceId ? 0.35 : 0.0;
+    const double hashX = hashUnit(hash, 12);
+    const double hashY = hashUnit(hash, 28);
+    particle.x = clamp((relX * geometryWeight + hashX * (1.0 - geometryWeight)) * width, 0.0,
+                       std::max(0.0, width - particle.w));
+    particle.y = clamp((relY * geometryWeight + hashY * (1.0 - geometryWeight)) * height, 0.0,
+                       std::max(0.0, height - particle.h));
 
     const double angle = hashUnit(hash, 0) * 2.0 * M_PI;
-    const double speed = 6.0 + hashUnit(hash, 16) * 16.0;
+    const double speed = 34.0 + hashUnit(hash, 16) * 58.0;
     particle.vx = std::cos(angle) * speed;
     particle.vy = std::sin(angle) * speed;
     particle.red = 0.12 + hashUnit(hash, 8) * 0.20;
@@ -258,12 +277,12 @@ Particle syntheticParticle(const std::string &monitorName, size_t index, int wid
     const uint64_t hash = hashString(monitorName + ":synthetic:" + std::to_string(index));
     Particle particle;
     particle.key = "synthetic:" + std::to_string(index);
-    particle.w = 28.0 + hashUnit(hash, 0) * 52.0;
-    particle.h = 20.0 + hashUnit(hash, 8) * 36.0;
+    particle.w = 150.0 + hashUnit(hash, 0) * 170.0;
+    particle.h = 96.0 + hashUnit(hash, 8) * 140.0;
     particle.x = hashUnit(hash, 16) * std::max(0.0, width - particle.w);
     particle.y = hashUnit(hash, 24) * std::max(0.0, height - particle.h);
-    particle.vx = (hashUnit(hash, 32) - 0.5) * 18.0;
-    particle.vy = (hashUnit(hash, 40) - 0.5) * 18.0;
+    particle.vx = (hashUnit(hash, 32) - 0.5) * 92.0;
+    particle.vy = (hashUnit(hash, 40) - 0.5) * 92.0;
     particle.red = 0.16;
     particle.green = 0.42;
     particle.blue = 0.48;
@@ -277,11 +296,12 @@ std::vector<Particle> desiredParticlesForSurface(const SurfaceState &surface, in
     const auto monitor = monitorForSurface(surface);
 
     for (const auto &client : g_clients) {
-        const bool visibleOnWorkspace =
-            monitor.activeWorkspaceId == 0 || client.workspaceId == monitor.activeWorkspaceId;
-        const bool onMonitor = client.monitorName.empty() || client.monitorName == monitor.name;
+        const bool onMonitor =
+            (client.monitorId >= 0 && client.monitorId == monitor.id) ||
+            (!client.monitorName.empty() && client.monitorName == monitor.name) ||
+            (client.monitorId < 0 && client.monitorName.empty());
 
-        if (!client.mapped || client.hidden || !visibleOnWorkspace || !onMonitor)
+        if (!client.mapped || client.hidden || !onMonitor)
             continue;
 
         particles.push_back(particleFromClient(client, monitor, width, height));
@@ -295,6 +315,52 @@ std::vector<Particle> desiredParticlesForSurface(const SurfaceState &surface, in
     return particles;
 }
 
+void clampParticleToBounds(Particle &particle, double width, double height) {
+    particle.x = clamp(particle.x, 0.0, std::max(0.0, width - particle.w));
+    particle.y = clamp(particle.y, 0.0, std::max(0.0, height - particle.h));
+}
+
+void placeParticleInCell(Particle &particle, size_t index, size_t count, double width,
+                         double height) {
+    if (count == 0)
+        return;
+
+    const double screenAspect = width / std::max(1.0, height);
+    const auto columns =
+        static_cast<size_t>(std::ceil(std::sqrt(static_cast<double>(count) * screenAspect)));
+    const auto rows = static_cast<size_t>(
+        std::ceil(static_cast<double>(count) / static_cast<double>(std::max<size_t>(1, columns))));
+    const double cellW = width / static_cast<double>(std::max<size_t>(1, columns));
+    const double cellH = height / static_cast<double>(std::max<size_t>(1, rows));
+    const size_t row = index / std::max<size_t>(1, columns);
+    const size_t col = index % std::max<size_t>(1, columns);
+
+    particle.w = std::min(particle.w, cellW * 0.78);
+    particle.h = std::min(particle.h, cellH * 0.72);
+
+    const uint64_t hash = hashString(particle.key);
+    const double slackX = std::max(0.0, cellW - particle.w);
+    const double slackY = std::max(0.0, cellH - particle.h);
+    particle.x = static_cast<double>(col) * cellW + hashUnit(hash, 0) * slackX;
+    particle.y = static_cast<double>(row) * cellH + hashUnit(hash, 16) * slackY;
+    particle.minX = static_cast<double>(col) * cellW;
+    particle.minY = static_cast<double>(row) * cellH;
+    particle.maxX = std::max(particle.minX, static_cast<double>(col + 1) * cellW - particle.w);
+    particle.maxY = std::max(particle.minY, static_cast<double>(row + 1) * cellH - particle.h);
+    particle.x = clamp(particle.x, particle.minX, particle.maxX);
+    particle.y = clamp(particle.y, particle.minY, particle.maxY);
+    clampParticleToBounds(particle, width, height);
+}
+
+void spreadParticlesWithoutOverlap(std::vector<Particle> &particles, double width, double height) {
+    std::ranges::sort(particles, [](const Particle &a, const Particle &b) {
+        return hashString(a.key) < hashString(b.key);
+    });
+
+    for (size_t i = 0; i < particles.size(); ++i)
+        placeParticleInCell(particles[i], i, particles.size(), width, height);
+}
+
 void refreshSurfaceParticles(SurfaceState &surface) {
     GtkAllocation allocation;
     gtk_widget_get_allocation(surface.area, &allocation);
@@ -306,9 +372,15 @@ void refreshSurfaceParticles(SurfaceState &surface) {
         existing.emplace(particle.key, particle);
 
     auto desired = desiredParticlesForSurface(surface, width, height);
+    const bool preservePositions =
+        surface.hasRealParticleLayout && desired.size() == existing.size() &&
+        std::ranges::all_of(desired, [&existing](const Particle &particle) {
+            return existing.contains(particle.key);
+        });
+
     for (auto &particle : desired) {
         const auto found = existing.find(particle.key);
-        if (found == existing.end())
+        if (!preservePositions || found == existing.end())
             continue;
 
         const auto old = found->second;
@@ -316,9 +388,18 @@ void refreshSurfaceParticles(SurfaceState &surface) {
         particle.y = clamp(old.y, 0.0, std::max(0.0, height - particle.h));
         particle.vx = old.vx;
         particle.vy = old.vy;
+        particle.minX = old.minX;
+        particle.minY = old.minY;
+        particle.maxX = old.maxX;
+        particle.maxY = old.maxY;
     }
 
+    if (!preservePositions)
+        spreadParticlesWithoutOverlap(desired, width, height);
+
     surface.particles = std::move(desired);
+    if (width > 100 && height > 100)
+        surface.hasRealParticleLayout = true;
 }
 
 void refreshHyprlandState() {
@@ -402,34 +483,20 @@ void stepParticles(SurfaceState &surface, double dt) {
         particle.x += particle.vx * dt;
         particle.y += particle.vy * dt;
 
-        if (particle.x < 0.0) {
-            particle.x = 0.0;
+        if (particle.x < particle.minX) {
+            particle.x = particle.minX;
             particle.vx = std::abs(particle.vx);
-        } else if (particle.x + particle.w > width) {
-            particle.x = width - particle.w;
+        } else if (particle.x > particle.maxX) {
+            particle.x = particle.maxX;
             particle.vx = -std::abs(particle.vx);
         }
 
-        if (particle.y < 0.0) {
-            particle.y = 0.0;
+        if (particle.y < particle.minY) {
+            particle.y = particle.minY;
             particle.vy = std::abs(particle.vy);
-        } else if (particle.y + particle.h > height) {
-            particle.y = height - particle.h;
+        } else if (particle.y > particle.maxY) {
+            particle.y = particle.maxY;
             particle.vy = -std::abs(particle.vy);
-        }
-    }
-
-    for (size_t i = 0; i < surface.particles.size(); ++i) {
-        for (size_t j = i + 1; j < surface.particles.size(); ++j) {
-            auto &a = surface.particles[i];
-            auto &b = surface.particles[j];
-            const bool overlaps =
-                a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-            if (!overlaps)
-                continue;
-
-            std::swap(a.vx, b.vx);
-            std::swap(a.vy, b.vy);
         }
     }
 }
@@ -437,6 +504,9 @@ void stepParticles(SurfaceState &surface, double dt) {
 gboolean onFrame(gpointer userData) {
     auto *surface = static_cast<SurfaceState *>(userData);
     const auto nowUs = g_get_monotonic_time();
+    if (!surface->hasRealParticleLayout)
+        refreshSurfaceParticles(*surface);
+
     if (surface->lastFrameUs == 0)
         surface->lastFrameUs = nowUs;
 
