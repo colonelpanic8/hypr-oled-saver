@@ -1,0 +1,25 @@
+# Build outputs
+build/
+result
+result-*
+
+# direnv
+.direnv/
+
+# C/C++
+*.d
+*.o
+*.so
+*.a
+*.lo
+*.la
+*.out
+*.exe
+
+# Editors
+.cache/
+.vscode/
+.idea/
+
+# Local worktrees
+.worktrees/
