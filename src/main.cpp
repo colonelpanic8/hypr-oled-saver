@@ -21,6 +21,7 @@ using json = nlohmann::json;
 
 namespace {
 
+constexpr const char *VERSION = "0.1.0";
 constexpr double FRAME_INTERVAL_SECONDS = 1.0 / 30.0;
 constexpr int FRAME_INTERVAL_MS = 33;
 constexpr int HYPR_REFRESH_MS = 5000;
@@ -524,6 +525,23 @@ void createSurfaces() {
 } // namespace
 
 int main(int argc, char **argv) {
+    if (argc > 1) {
+        const std::string arg = argv[1];
+
+        if (arg == "--help" || arg == "-h") {
+            std::printf(
+                "Usage: hypr-oled-saver [--help] [--version]\n\n"
+                "Starts an OLED-friendly GTK layer-shell screensaver for Hyprland.\n"
+                "Stop it by terminating the process, for example: pkill -x hypr-oled-saver\n");
+            return 0;
+        }
+
+        if (arg == "--version") {
+            std::printf("hypr-oled-saver %s\n", VERSION);
+            return 0;
+        }
+    }
+
     gtk_init(&argc, &argv);
 
     refreshHyprlandState();
