@@ -238,8 +238,8 @@ Particle particleFromClient(const ClientInfo &client, const MonitorInfo &monitor
 
     Particle particle;
     particle.key = client.key;
-    particle.w = clamp(16.0 + areaScale * 88.0 * std::sqrt(aspect), 10.0, 76.0);
-    particle.h = clamp(particle.w / aspect, 8.0, 48.0);
+    particle.w = clamp(42.0 + areaScale * 210.0 * std::sqrt(aspect), 36.0, 180.0);
+    particle.h = clamp(particle.w / aspect, 24.0, 112.0);
     particle.x = clamp(relX * width, 0.0, std::max(0.0, width - particle.w));
     particle.y = clamp(relY * height, 0.0, std::max(0.0, height - particle.h));
 
@@ -247,10 +247,10 @@ Particle particleFromClient(const ClientInfo &client, const MonitorInfo &monitor
     const double speed = 6.0 + hashUnit(hash, 16) * 16.0;
     particle.vx = std::cos(angle) * speed;
     particle.vy = std::sin(angle) * speed;
-    particle.red = 0.08 + hashUnit(hash, 8) * 0.16;
-    particle.green = 0.18 + hashUnit(hash, 24) * 0.28;
-    particle.blue = 0.22 + hashUnit(hash, 40) * 0.30;
-    particle.alpha = 0.08 + hashUnit(hash, 48) * 0.05;
+    particle.red = 0.12 + hashUnit(hash, 8) * 0.20;
+    particle.green = 0.28 + hashUnit(hash, 24) * 0.34;
+    particle.blue = 0.34 + hashUnit(hash, 40) * 0.34;
+    particle.alpha = 0.20 + hashUnit(hash, 48) * 0.12;
     return particle;
 }
 
@@ -258,16 +258,16 @@ Particle syntheticParticle(const std::string &monitorName, size_t index, int wid
     const uint64_t hash = hashString(monitorName + ":synthetic:" + std::to_string(index));
     Particle particle;
     particle.key = "synthetic:" + std::to_string(index);
-    particle.w = 8.0 + hashUnit(hash, 0) * 18.0;
-    particle.h = 6.0 + hashUnit(hash, 8) * 14.0;
+    particle.w = 28.0 + hashUnit(hash, 0) * 52.0;
+    particle.h = 20.0 + hashUnit(hash, 8) * 36.0;
     particle.x = hashUnit(hash, 16) * std::max(0.0, width - particle.w);
     particle.y = hashUnit(hash, 24) * std::max(0.0, height - particle.h);
     particle.vx = (hashUnit(hash, 32) - 0.5) * 18.0;
     particle.vy = (hashUnit(hash, 40) - 0.5) * 18.0;
-    particle.red = 0.12;
-    particle.green = 0.26;
-    particle.blue = 0.30;
-    particle.alpha = 0.07;
+    particle.red = 0.16;
+    particle.green = 0.42;
+    particle.blue = 0.48;
+    particle.alpha = 0.22;
     return particle;
 }
 
@@ -362,7 +362,7 @@ void drawClock(cairo_t *cr, GtkWidget *widget) {
     const double x = 40.0 + (std::sin(seconds / 37.0) * 0.5 + 0.5) * xTravel;
     const double y = 40.0 + (std::cos(seconds / 53.0) * 0.5 + 0.5) * yTravel;
 
-    cairo_set_source_rgba(cr, 0.34, 0.48, 0.50, 0.34);
+    cairo_set_source_rgba(cr, 0.42, 0.62, 0.64, 0.58);
     cairo_move_to(cr, x, y);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);
