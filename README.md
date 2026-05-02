@@ -38,6 +38,10 @@ Dispatcher actions:
 hyprctl dispatch hyproledsaver start
 hyprctl dispatch hyproledsaver stop
 hyprctl dispatch hyproledsaver toggle
+hyprctl dispatch hyproledsaver activate
+hyprctl dispatch hyproledsaver deactivate
+hyprctl dispatch hyproledsaver present
+hyprctl dispatch hyproledsaver dismiss
 ```
 
 If your Hyprland config layer has trouble passing dispatcher arguments, the
@@ -47,14 +51,35 @@ plugin also registers no-argument dispatchers:
 hyprctl dispatch hyproledsaverstart
 hyprctl dispatch hyproledsaverstop
 hyprctl dispatch hyproledsavertoggle
+hyprctl dispatch hyproledsaveractivate
+hyprctl dispatch hyproledsaverdeactivate
+hyprctl dispatch hyproledsaverpresent
+hyprctl dispatch hyproledsaverdismiss
 ```
 
 Lua-based Hyprland configs can call the plugin directly:
 
 ```lua
+hl.plugin.hyproledsaver.set_active(true)
+hl.plugin.hyproledsaver.set_active(false)
+hl.plugin.hyproledsaver.is_active()
+hl.plugin.hyproledsaver.activate()
+hl.plugin.hyproledsaver.deactivate()
+hl.plugin.hyproledsaver.present()
+hl.plugin.hyproledsaver.dismiss()
 hl.plugin.hyproledsaver.start()
 hl.plugin.hyproledsaver.stop()
 hl.plugin.hyproledsaver.toggle()
+```
+
+Example Lua bind:
+
+```lua
+bind(main_mod .. " + O", function()
+  if hl.plugin and hl.plugin.hyproledsaver then
+    hl.plugin.hyproledsaver.toggle()
+  end
+end)
 ```
 
 Config values use the `hyproledsaver` plugin namespace:
@@ -70,6 +95,11 @@ plugin:hyproledsaver:opacity = 0.82
 ```
 
 ## Hypridle
+
+The plugin intentionally does not own idle policy. Use the plugin API for
+manual state changes and `hypridle` for idle/resume triggers. Keeping idle
+timing in `hypridle` avoids duplicating lock/DPMS/inhibitor logic inside the
+plugin.
 
 ```conf
 listener {

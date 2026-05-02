@@ -467,13 +467,19 @@ static SDispatchResult toggleSaver() {
     return startSaver();
 }
 
+static SDispatchResult setSaverActive(bool active) {
+    return active ? startSaver() : stopSaver();
+}
+
 static SDispatchResult controlSaver(std::string arg) {
     std::ranges::transform(arg, arg.begin(), [](unsigned char c) { return std::tolower(c); });
 
-    if (arg.empty() || arg == "start" || arg == "on" || arg == "open")
+    if (arg.empty() || arg == "start" || arg == "on" || arg == "open" || arg == "activate" ||
+        arg == "active" || arg == "enable" || arg == "present")
         return startSaver();
 
-    if (arg == "stop" || arg == "off" || arg == "close")
+    if (arg == "stop" || arg == "off" || arg == "close" || arg == "deactivate" ||
+        arg == "inactive" || arg == "disable" || arg == "dismiss")
         return stopSaver();
 
     if (arg == "toggle")
@@ -496,6 +502,22 @@ static SDispatchResult onStopDispatcher(std::string) {
 
 static SDispatchResult onToggleDispatcher(std::string) {
     return toggleSaver();
+}
+
+static SDispatchResult onActivateDispatcher(std::string) {
+    return startSaver();
+}
+
+static SDispatchResult onDeactivateDispatcher(std::string) {
+    return stopSaver();
+}
+
+static SDispatchResult onPresentDispatcher(std::string) {
+    return startSaver();
+}
+
+static SDispatchResult onDismissDispatcher(std::string) {
+    return stopSaver();
 }
 
 static int luaNoop(lua_State *) {
@@ -523,6 +545,34 @@ static int luaToggle(lua_State *L) {
     return luaControl(L, "toggle");
 }
 
+static int luaActivate(lua_State *L) {
+    return luaControl(L, "activate");
+}
+
+static int luaDeactivate(lua_State *L) {
+    return luaControl(L, "deactivate");
+}
+
+static int luaPresent(lua_State *L) {
+    return luaControl(L, "present");
+}
+
+static int luaDismiss(lua_State *L) {
+    return luaControl(L, "dismiss");
+}
+
+static int luaSetActive(lua_State *L) {
+    if (lua_gettop(L) < 1 || !lua_isboolean(L, 1))
+        return luaL_error(L, "hyproledsaver.set_active: argument must be a boolean");
+
+    const auto result = setSaverActive(lua_toboolean(L, 1));
+    if (!result.success)
+        return luaL_error(L, "%s", result.error.c_str());
+
+    lua_pushcfunction(L, ::luaNoop);
+    return 1;
+}
+
 static int luaRun(lua_State *L) {
     std::string arg = "toggle";
 
@@ -539,6 +589,10 @@ static int luaRun(lua_State *L) {
 static int luaEnabled(lua_State *L) {
     lua_pushboolean(L, g_pOledSaver != nullptr);
     return 1;
+}
+
+static int luaIsActive(lua_State *L) {
+    return luaEnabled(L);
 }
 
 static int luaRefresh(lua_State *L) {
@@ -597,11 +651,21 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaverstart", ::onStartDispatcher);
     HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaverstop", ::onStopDispatcher);
     HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsavertoggle", ::onToggleDispatcher);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaveractivate", ::onActivateDispatcher);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaverdeactivate", ::onDeactivateDispatcher);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaverpresent", ::onPresentDispatcher);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaverdismiss", ::onDismissDispatcher);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "start", ::luaStart);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "stop", ::luaStop);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "toggle", ::luaToggle);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "activate", ::luaActivate);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "deactivate", ::luaDeactivate);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "present", ::luaPresent);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "dismiss", ::luaDismiss);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "set_active", ::luaSetActive);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "run", ::luaRun);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "enabled", ::luaEnabled);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "is_active", ::luaIsActive);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "refresh", ::luaRefresh);
     HyprlandAPI::reloadConfig();
 
