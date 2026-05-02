@@ -1,94 +1,83 @@
-#include <gtk-layer-shell/gtk-layer-shell.h>
-#include <gtk/gtk.h>
-#include <nlohmann/json.hpp>
-#include <pango/pangocairo.h>
+#define WLR_USE_UNSTABLE
 
 #include <algorithm>
-#include <array>
+#include <any>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
-#include <ctime>
-#include <memory>
-#include <optional>
-#include <random>
+#include <cstdint>
+#include <drm_fourcc.h>
+#include <lua.hpp>
+#include <stdexcept>
 #include <string>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
-using json = nlohmann::json;
+#define private public
+#define protected public
+#include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/config/ConfigManager.hpp>
+#include <hyprland/src/config/values/types/ColorValue.hpp>
+#include <hyprland/src/config/values/types/FloatValue.hpp>
+#include <hyprland/src/config/values/types/IntValue.hpp>
+#include <hyprland/src/debug/log/Logger.hpp>
+#include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/event/EventBus.hpp>
+#include <hyprland/src/helpers/time/Time.hpp>
+#include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/render/Framebuffer.hpp>
+#include <hyprland/src/render/OpenGL.hpp>
+#include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/render/pass/PassElement.hpp>
+#undef private
+#undef protected
+
+inline HANDLE PHANDLE = nullptr;
 
 namespace {
 
-constexpr const char *VERSION = "0.1.0";
-constexpr double FRAME_INTERVAL_SECONDS = 1.0 / 30.0;
-constexpr int FRAME_INTERVAL_MS = 33;
-constexpr int HYPR_REFRESH_MS = 5000;
+class COledSaver;
+inline std::unique_ptr<COledSaver> g_pOledSaver;
 
-struct Rect {
-    int x = 0;
-    int y = 0;
-    int width = 1920;
-    int height = 1080;
-};
-
-struct MonitorInfo {
-    int id = -1;
-    std::string name;
-    Rect geometry;
-    int activeWorkspaceId = 0;
-};
-
-struct ClientInfo {
-    std::string key;
-    std::string className;
-    std::string title;
-    std::string monitorName;
-    int monitorId = -1;
-    int workspaceId = 0;
-    Rect geometry;
-    bool mapped = true;
-    bool hidden = false;
-};
-
-struct Particle {
-    std::string key;
-    double x = 0;
-    double y = 0;
-    double w = 18;
-    double h = 12;
-    double vx = 12;
-    double vy = 9;
-    double minX = 0;
-    double minY = 0;
-    double maxX = 0;
-    double maxY = 0;
-    double red = 0.20;
-    double green = 0.42;
-    double blue = 0.54;
-    double alpha = 0.10;
-};
-
-struct SurfaceState {
-    GtkWidget *window = nullptr;
-    GtkWidget *area = nullptr;
-    std::string monitorName;
-    Rect hyprGeometry;
-    std::vector<Particle> particles;
-    gint64 lastFrameUs = 0;
-    bool hasRealParticleLayout = false;
-};
-
-std::vector<std::unique_ptr<SurfaceState>> g_surfaces;
-std::vector<MonitorInfo> g_monitors;
-std::vector<ClientInfo> g_clients;
-
-double clamp(double value, double low, double high) {
-    return std::max(low, std::min(high, value));
+static const CConfigValue<Config::INTEGER> &PBACKGROUND() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:background");
+    return VALUE;
 }
 
-uint64_t hashString(const std::string &value) {
+static const CConfigValue<Config::INTEGER> &PBORDER() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:border_color");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PBORDERSIZE() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:border_size");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PMARGIN() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:margin");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PGAP() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:gap");
+    return VALUE;
+}
+
+static const CConfigValue<Config::FLOAT> &PSPEED() {
+    static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:speed");
+    return VALUE;
+}
+
+static const CConfigValue<Config::FLOAT> &POPACITY() {
+    static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:opacity");
+    return VALUE;
+}
+
+static uint32_t framebufferFormatWithAlpha(uint32_t) {
+    return DRM_FORMAT_ABGR8888;
+}
+
+static uint64_t hashString(const std::string &value) {
     uint64_t hash = 1469598103934665603ULL;
     for (unsigned char c : value) {
         hash ^= c;
@@ -97,527 +86,532 @@ uint64_t hashString(const std::string &value) {
     return hash;
 }
 
-double hashUnit(uint64_t hash, int shift) {
+static double hashUnit(uint64_t hash, int shift) {
     return static_cast<double>((hash >> shift) & 0xffff) / 65535.0;
 }
 
-std::string runCommand(const char *command) {
-    std::array<char, 4096> buffer{};
-    std::string output;
+static bool previewableWindow(const PHLWINDOW &window) {
+    if (!window || !window->m_isMapped || window->isHidden() || window->m_fadingOut ||
+        !window->m_workspace)
+        return false;
 
-    FILE *pipe = popen(command, "r");
-    if (!pipe)
-        return output;
+    if (window->m_size.x <= 1 || window->m_size.y <= 1 || window->m_realSize->value().x <= 1 ||
+        window->m_realSize->value().y <= 1)
+        return false;
 
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe))
-        output += buffer.data();
-
-    pclose(pipe);
-    return output;
+    return true;
 }
 
-std::optional<json> commandJson(const char *command) {
-    const auto output = runCommand(command);
-    if (output.empty())
-        return std::nullopt;
-
-    auto parsed = json::parse(output, nullptr, false);
-    if (parsed.is_discarded())
-        return std::nullopt;
-
-    return parsed;
+static void clampBoxToBounds(CBox &box, const Vector2D &size) {
+    box.x = std::clamp(box.x, 0.0, std::max(0.0, size.x - box.w));
+    box.y = std::clamp(box.y, 0.0, std::max(0.0, size.y - box.h));
 }
 
-int jsonInt(const json &object, const char *key, int fallback = 0) {
-    if (!object.contains(key) || !object.at(key).is_number())
-        return fallback;
-    return object.at(key).get<int>();
+static bool boxesOverlap(const CBox &a, const CBox &b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
-std::string jsonString(const json &object, const char *key) {
-    if (!object.contains(key) || !object.at(key).is_string())
-        return {};
-    return object.at(key).get<std::string>();
-}
+struct SPreview {
+    PHLWINDOW window;
+    SP<Render::IFramebuffer> fb;
+    CBox box;
+    Vector2D velocity;
+};
 
-Rect jsonRectFromArrays(const json &object) {
-    Rect result;
-
-    if (object.contains("at") && object.at("at").is_array() && object.at("at").size() >= 2) {
-        result.x = object.at("at").at(0).get<int>();
-        result.y = object.at("at").at(1).get<int>();
+class COledSaver {
+  public:
+    explicit COledSaver(PHLMONITOR monitor) : pMonitor(monitor) {
+        lastFrame = Time::steadyNow();
+        refreshWindows();
+        damage();
     }
 
-    if (object.contains("size") && object.at("size").is_array() && object.at("size").size() >= 2) {
-        result.width = object.at("size").at(0).get<int>();
-        result.height = object.at("size").at(1).get<int>();
+    ~COledSaver() {
+        Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        for (auto &preview : previews)
+            preview.fb.reset();
+        previews.clear();
     }
 
-    return result;
-}
-
-std::vector<MonitorInfo> loadMonitors() {
-    std::vector<MonitorInfo> result;
-    const auto monitors = commandJson("hyprctl -j monitors 2>/dev/null");
-    if (!monitors || !monitors->is_array())
-        return result;
-
-    for (const auto &item : *monitors) {
-        MonitorInfo monitor;
-        monitor.id = jsonInt(item, "id", -1);
-        monitor.name = jsonString(item, "name");
-        monitor.geometry.x = jsonInt(item, "x");
-        monitor.geometry.y = jsonInt(item, "y");
-        monitor.geometry.width = jsonInt(item, "width", 1920);
-        monitor.geometry.height = jsonInt(item, "height", 1080);
-
-        if (item.contains("activeWorkspace") && item.at("activeWorkspace").is_object())
-            monitor.activeWorkspaceId = jsonInt(item.at("activeWorkspace"), "id");
-
-        if (!monitor.name.empty())
-            result.push_back(std::move(monitor));
+    void render() {
+        g_pHyprRenderer->m_renderPass.add(makeUnique<COledSaverPassElement>());
     }
 
-    return result;
-}
+    void draw() {
+        if (!pMonitor)
+            return;
 
-std::vector<ClientInfo> loadClients() {
-    std::vector<ClientInfo> result;
-    const auto clients = commandJson("hyprctl -j clients 2>/dev/null");
-    if (!clients || !clients->is_array())
-        return result;
+        stepPhysics();
 
-    for (const auto &item : *clients) {
-        ClientInfo client;
-        client.key = jsonString(item, "address");
-        client.className = jsonString(item, "class");
-        client.title = jsonString(item, "title");
-        client.geometry = jsonRectFromArrays(item);
+        CRegion fullDamage = {0, 0, INT16_MAX, INT16_MAX};
+        Render::GL::g_pHyprOpenGL->renderRect(CBox{{0, 0}, pMonitor->m_pixelSize},
+                                              CHyprColor(*PBACKGROUND()), {.damage = &fullDamage});
 
-        if (item.contains("monitor")) {
-            if (item.at("monitor").is_number_integer())
-                client.monitorId = item.at("monitor").get<int>();
-            else if (item.at("monitor").is_string())
-                client.monitorName = item.at("monitor").get<std::string>();
+        const double scale = pMonitor->m_scale;
+        const int border = std::max<Config::INTEGER>(0, *PBORDERSIZE());
+        const float opacity = std::clamp<float>(*POPACITY(), 0.05F, 1.0F);
+
+        for (auto &preview : previews) {
+            if (!preview.window || !preview.fb || !preview.fb->getTexture())
+                continue;
+
+            CBox tilePx = preview.box.copy().scale(scale).round();
+            CBox texBox = {
+                tilePx.x,
+                tilePx.y,
+                pMonitor->m_pixelSize.x *
+                    (tilePx.w / std::max(1.0, preview.window->m_realSize->value().x * scale)),
+                pMonitor->m_pixelSize.y *
+                    (tilePx.h / std::max(1.0, preview.window->m_realSize->value().y * scale)),
+            };
+
+            if (border > 0)
+                Render::GL::g_pHyprOpenGL->renderRect(tilePx.copy().expand(border),
+                                                      CHyprColor(*PBORDER()),
+                                                      {.damage = &fullDamage, .round = border * 2});
+
+            g_pHyprRenderer->m_renderData.clipBox = tilePx;
+            Render::GL::g_pHyprOpenGL->renderTexture(
+                preview.fb->getTexture(), texBox,
+                {.damage = &fullDamage, .a = opacity, .round = border * 2});
+            g_pHyprRenderer->m_renderData.clipBox = {};
         }
 
-        if (item.contains("workspace") && item.at("workspace").is_object())
-            client.workspaceId = jsonInt(item.at("workspace"), "id");
-
-        if (item.contains("mapped") && item.at("mapped").is_boolean())
-            client.mapped = item.at("mapped").get<bool>();
-
-        if (item.contains("hidden") && item.at("hidden").is_boolean())
-            client.hidden = item.at("hidden").get<bool>();
-
-        if (client.key.empty())
-            client.key = client.className + ":" + client.title;
-
-        result.push_back(std::move(client));
+        damage();
     }
 
-    return result;
-}
-
-MonitorInfo monitorForSurface(const SurfaceState &surface) {
-    for (const auto &monitor : g_monitors) {
-        if (monitor.name == surface.monitorName)
-            return monitor;
+    void damage() {
+        if (pMonitor)
+            g_pHyprRenderer->damageMonitor(pMonitor.lock());
     }
 
-    MonitorInfo fallback;
-    fallback.name = surface.monitorName;
-    fallback.geometry = surface.hyprGeometry;
-    return fallback;
-}
+    PHLMONITORREF pMonitor;
 
-Particle particleFromClient(const ClientInfo &client, const MonitorInfo &monitor, int width,
-                            int height) {
-    const uint64_t hash = hashString(client.key + client.className + client.title);
-
-    const double monitorWidth = std::max(1, monitor.geometry.width);
-    const double monitorHeight = std::max(1, monitor.geometry.height);
-    const double relX =
-        (static_cast<double>(client.geometry.x - monitor.geometry.x) / monitorWidth);
-    const double relY =
-        (static_cast<double>(client.geometry.y - monitor.geometry.y) / monitorHeight);
-
-    const double aspect =
-        clamp(static_cast<double>(client.geometry.width) / std::max(1, client.geometry.height),
-              0.35, 3.5);
-    const double areaScale =
-        std::sqrt(std::max(1.0, static_cast<double>(client.geometry.width) *
-                                    static_cast<double>(client.geometry.height)) /
-                  std::max(1.0, monitorWidth * monitorHeight));
-
-    Particle particle;
-    particle.key = client.key;
-    particle.w = clamp(170.0 + areaScale * 260.0 * std::sqrt(aspect), 160.0, 420.0);
-    particle.h = clamp(particle.w / aspect, 96.0, 260.0);
-    const double geometryWeight = client.workspaceId == monitor.activeWorkspaceId ? 0.35 : 0.0;
-    const double hashX = hashUnit(hash, 12);
-    const double hashY = hashUnit(hash, 28);
-    particle.x = clamp((relX * geometryWeight + hashX * (1.0 - geometryWeight)) * width, 0.0,
-                       std::max(0.0, width - particle.w));
-    particle.y = clamp((relY * geometryWeight + hashY * (1.0 - geometryWeight)) * height, 0.0,
-                       std::max(0.0, height - particle.h));
-
-    const double angle = hashUnit(hash, 0) * 2.0 * M_PI;
-    const double speed = 34.0 + hashUnit(hash, 16) * 58.0;
-    particle.vx = std::cos(angle) * speed;
-    particle.vy = std::sin(angle) * speed;
-    particle.red = 0.12 + hashUnit(hash, 8) * 0.20;
-    particle.green = 0.28 + hashUnit(hash, 24) * 0.34;
-    particle.blue = 0.34 + hashUnit(hash, 40) * 0.34;
-    particle.alpha = 0.20 + hashUnit(hash, 48) * 0.12;
-    return particle;
-}
-
-Particle syntheticParticle(const std::string &monitorName, size_t index, int width, int height) {
-    const uint64_t hash = hashString(monitorName + ":synthetic:" + std::to_string(index));
-    Particle particle;
-    particle.key = "synthetic:" + std::to_string(index);
-    particle.w = 150.0 + hashUnit(hash, 0) * 170.0;
-    particle.h = 96.0 + hashUnit(hash, 8) * 140.0;
-    particle.x = hashUnit(hash, 16) * std::max(0.0, width - particle.w);
-    particle.y = hashUnit(hash, 24) * std::max(0.0, height - particle.h);
-    particle.vx = (hashUnit(hash, 32) - 0.5) * 92.0;
-    particle.vy = (hashUnit(hash, 40) - 0.5) * 92.0;
-    particle.red = 0.16;
-    particle.green = 0.42;
-    particle.blue = 0.48;
-    particle.alpha = 0.22;
-    return particle;
-}
-
-std::vector<Particle> desiredParticlesForSurface(const SurfaceState &surface, int width,
-                                                 int height) {
-    std::vector<Particle> particles;
-    const auto monitor = monitorForSurface(surface);
-
-    for (const auto &client : g_clients) {
-        const bool onMonitor =
-            (client.monitorId >= 0 && client.monitorId == monitor.id) ||
-            (!client.monitorName.empty() && client.monitorName == monitor.name) ||
-            (client.monitorId < 0 && client.monitorName.empty());
-
-        if (!client.mapped || client.hidden || !onMonitor)
-            continue;
-
-        particles.push_back(particleFromClient(client, monitor, width, height));
-    }
-
-    if (particles.empty()) {
-        for (size_t i = 0; i < 5; ++i)
-            particles.push_back(syntheticParticle(surface.monitorName, i, width, height));
-    }
-
-    return particles;
-}
-
-void clampParticleToBounds(Particle &particle, double width, double height) {
-    particle.x = clamp(particle.x, 0.0, std::max(0.0, width - particle.w));
-    particle.y = clamp(particle.y, 0.0, std::max(0.0, height - particle.h));
-}
-
-void placeParticleInCell(Particle &particle, size_t index, size_t count, double width,
-                         double height) {
-    if (count == 0)
-        return;
-
-    const double screenAspect = width / std::max(1.0, height);
-    const auto columns =
-        static_cast<size_t>(std::ceil(std::sqrt(static_cast<double>(count) * screenAspect)));
-    const auto rows = static_cast<size_t>(
-        std::ceil(static_cast<double>(count) / static_cast<double>(std::max<size_t>(1, columns))));
-    const double cellW = width / static_cast<double>(std::max<size_t>(1, columns));
-    const double cellH = height / static_cast<double>(std::max<size_t>(1, rows));
-    const size_t row = index / std::max<size_t>(1, columns);
-    const size_t col = index % std::max<size_t>(1, columns);
-
-    particle.w = std::min(particle.w, cellW * 0.78);
-    particle.h = std::min(particle.h, cellH * 0.72);
-
-    const uint64_t hash = hashString(particle.key);
-    const double slackX = std::max(0.0, cellW - particle.w);
-    const double slackY = std::max(0.0, cellH - particle.h);
-    particle.x = static_cast<double>(col) * cellW + hashUnit(hash, 0) * slackX;
-    particle.y = static_cast<double>(row) * cellH + hashUnit(hash, 16) * slackY;
-    particle.minX = static_cast<double>(col) * cellW;
-    particle.minY = static_cast<double>(row) * cellH;
-    particle.maxX = std::max(particle.minX, static_cast<double>(col + 1) * cellW - particle.w);
-    particle.maxY = std::max(particle.minY, static_cast<double>(row + 1) * cellH - particle.h);
-    particle.x = clamp(particle.x, particle.minX, particle.maxX);
-    particle.y = clamp(particle.y, particle.minY, particle.maxY);
-    clampParticleToBounds(particle, width, height);
-}
-
-void spreadParticlesWithoutOverlap(std::vector<Particle> &particles, double width, double height) {
-    std::ranges::sort(particles, [](const Particle &a, const Particle &b) {
-        return hashString(a.key) < hashString(b.key);
-    });
-
-    for (size_t i = 0; i < particles.size(); ++i)
-        placeParticleInCell(particles[i], i, particles.size(), width, height);
-}
-
-void refreshSurfaceParticles(SurfaceState &surface) {
-    GtkAllocation allocation;
-    gtk_widget_get_allocation(surface.area, &allocation);
-    const int width = std::max(1, allocation.width);
-    const int height = std::max(1, allocation.height);
-
-    std::unordered_map<std::string, Particle> existing;
-    for (const auto &particle : surface.particles)
-        existing.emplace(particle.key, particle);
-
-    auto desired = desiredParticlesForSurface(surface, width, height);
-    const bool preservePositions =
-        surface.hasRealParticleLayout && desired.size() == existing.size() &&
-        std::ranges::all_of(desired, [&existing](const Particle &particle) {
-            return existing.contains(particle.key);
-        });
-
-    for (auto &particle : desired) {
-        const auto found = existing.find(particle.key);
-        if (!preservePositions || found == existing.end())
-            continue;
-
-        const auto old = found->second;
-        particle.x = clamp(old.x, 0.0, std::max(0.0, width - particle.w));
-        particle.y = clamp(old.y, 0.0, std::max(0.0, height - particle.h));
-        particle.vx = old.vx;
-        particle.vy = old.vy;
-        particle.minX = old.minX;
-        particle.minY = old.minY;
-        particle.maxX = old.maxX;
-        particle.maxY = old.maxY;
-    }
-
-    if (!preservePositions)
-        spreadParticlesWithoutOverlap(desired, width, height);
-
-    surface.particles = std::move(desired);
-    if (width > 100 && height > 100)
-        surface.hasRealParticleLayout = true;
-}
-
-void refreshHyprlandState() {
-    auto monitors = loadMonitors();
-    auto clients = loadClients();
-
-    if (!monitors.empty())
-        g_monitors = std::move(monitors);
-
-    g_clients = std::move(clients);
-
-    for (auto &surface : g_surfaces)
-        refreshSurfaceParticles(*surface);
-}
-
-void drawClock(cairo_t *cr, GtkWidget *widget) {
-    GtkAllocation allocation;
-    gtk_widget_get_allocation(widget, &allocation);
-
-    const auto nowTime = std::time(nullptr);
-    std::tm localTime{};
-    localtime_r(&nowTime, &localTime);
-
-    char buffer[16]{};
-    std::strftime(buffer, sizeof(buffer), "%H:%M", &localTime);
-
-    PangoLayout *layout = pango_cairo_create_layout(cr);
-    pango_layout_set_text(layout, buffer, -1);
-
-    PangoFontDescription *font = pango_font_description_from_string("Noto Sans 34");
-    pango_layout_set_font_description(layout, font);
-    pango_font_description_free(font);
-
-    int textWidth = 0;
-    int textHeight = 0;
-    pango_layout_get_pixel_size(layout, &textWidth, &textHeight);
-
-    const double seconds = static_cast<double>(g_get_monotonic_time()) / 1000000.0;
-    const double xTravel = std::max(1, allocation.width - textWidth - 80);
-    const double yTravel = std::max(1, allocation.height - textHeight - 80);
-    const double x = 40.0 + (std::sin(seconds / 37.0) * 0.5 + 0.5) * xTravel;
-    const double y = 40.0 + (std::cos(seconds / 53.0) * 0.5 + 0.5) * yTravel;
-
-    cairo_set_source_rgba(cr, 0.42, 0.62, 0.64, 0.58);
-    cairo_move_to(cr, x, y);
-    pango_cairo_show_layout(cr, layout);
-    g_object_unref(layout);
-}
-
-gboolean onDraw(GtkWidget *widget, cairo_t *cr, gpointer userData) {
-    auto *surface = static_cast<SurfaceState *>(userData);
-
-    GtkAllocation allocation;
-    gtk_widget_get_allocation(widget, &allocation);
-
-    cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
-    cairo_paint(cr);
-
-    for (const auto &particle : surface->particles) {
-        cairo_set_source_rgba(cr, particle.red, particle.green, particle.blue, particle.alpha);
-        cairo_rectangle(cr, particle.x, particle.y, particle.w, particle.h);
-        cairo_fill_preserve(cr);
-        cairo_set_source_rgba(cr, particle.red + 0.08, particle.green + 0.08, particle.blue + 0.08,
-                              particle.alpha + 0.05);
-        cairo_set_line_width(cr, 1.0);
-        cairo_stroke(cr);
-    }
-
-    drawClock(cr, widget);
-    return FALSE;
-}
-
-void stepParticles(SurfaceState &surface, double dt) {
-    GtkAllocation allocation;
-    gtk_widget_get_allocation(surface.area, &allocation);
-
-    const double width = std::max(1, allocation.width);
-    const double height = std::max(1, allocation.height);
-
-    for (auto &particle : surface.particles) {
-        particle.x += particle.vx * dt;
-        particle.y += particle.vy * dt;
-
-        if (particle.x < particle.minX) {
-            particle.x = particle.minX;
-            particle.vx = std::abs(particle.vx);
-        } else if (particle.x > particle.maxX) {
-            particle.x = particle.maxX;
-            particle.vx = -std::abs(particle.vx);
+  private:
+    class COledSaverPassElement : public IPassElement {
+      public:
+        std::vector<UP<IPassElement>> draw() override {
+            if (g_pOledSaver)
+                g_pOledSaver->draw();
+            return {};
         }
 
-        if (particle.y < particle.minY) {
-            particle.y = particle.minY;
-            particle.vy = std::abs(particle.vy);
-        } else if (particle.y > particle.maxY) {
-            particle.y = particle.maxY;
-            particle.vy = -std::abs(particle.vy);
+        bool needsLiveBlur() override {
+            return false;
         }
+
+        bool needsPrecomputeBlur() override {
+            return false;
+        }
+
+        std::optional<CBox> boundingBox() override {
+            if (!g_pOledSaver || !g_pOledSaver->pMonitor)
+                return std::nullopt;
+            return CBox{{0, 0}, g_pOledSaver->pMonitor->m_size};
+        }
+
+        CRegion opaqueRegion() override {
+            if (!g_pOledSaver || !g_pOledSaver->pMonitor)
+                return {};
+            return CBox{{0, 0}, g_pOledSaver->pMonitor->m_size};
+        }
+
+        const char *passName() override {
+            return "COledSaverPassElement";
+        }
+
+        ePassElementType type() override {
+            return EK_CUSTOM;
+        }
+    };
+
+    void refreshWindows() {
+        previews.clear();
+
+        for (auto it = g_pCompositor->m_windows.rbegin(); it != g_pCompositor->m_windows.rend();
+             ++it) {
+            const auto &window = *it;
+            if (!previewableWindow(window))
+                continue;
+            previews.push_back({.window = window});
+        }
+
+        std::ranges::reverse(previews);
+        layoutInitialGrid();
+        renderSnapshots();
     }
-}
 
-gboolean onFrame(gpointer userData) {
-    auto *surface = static_cast<SurfaceState *>(userData);
-    const auto nowUs = g_get_monotonic_time();
-    if (!surface->hasRealParticleLayout)
-        refreshSurfaceParticles(*surface);
+    void layoutInitialGrid() {
+        if (!pMonitor || previews.empty())
+            return;
 
-    if (surface->lastFrameUs == 0)
-        surface->lastFrameUs = nowUs;
+        const double count = previews.size();
+        const double aspect = std::max(0.1, pMonitor->m_size.x / std::max(1.0, pMonitor->m_size.y));
+        int cols = std::max(1, (int)std::ceil(std::sqrt(count * aspect)));
+        int rows = std::max(1, (int)std::ceil(count / cols));
 
-    const double dt =
-        clamp(static_cast<double>(nowUs - surface->lastFrameUs) / 1000000.0, 0.0, 0.2);
-    surface->lastFrameUs = nowUs;
+        while (cols > 1 && (cols - 1) * rows >= (int)previews.size())
+            cols--;
 
-    stepParticles(*surface, dt);
-    gtk_widget_queue_draw(surface->area);
-    return G_SOURCE_CONTINUE;
-}
+        rows = std::max(1, (int)std::ceil(count / cols));
 
-gboolean onRefresh(gpointer) {
-    refreshHyprlandState();
-    return G_SOURCE_CONTINUE;
-}
+        const double margin = std::max<Config::INTEGER>(0, *PMARGIN());
+        const double gap = std::max<Config::INTEGER>(0, *PGAP());
+        const double areaW = std::max(1.0, pMonitor->m_size.x - margin * 2.0);
+        const double areaH = std::max(1.0, pMonitor->m_size.y - margin * 2.0);
+        const double cellW = (areaW - gap * (cols - 1)) / cols;
+        const double cellH = (areaH - gap * (rows - 1)) / rows;
 
-void configureLayerWindow(GtkWindow *window, GdkMonitor *monitor) {
-    gtk_layer_init_for_window(window);
-    gtk_layer_set_namespace(window, "hypr-oled-saver");
-    gtk_layer_set_layer(window, GTK_LAYER_SHELL_LAYER_OVERLAY);
-    gtk_layer_set_monitor(window, monitor);
-    gtk_layer_set_keyboard_mode(window, GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
-    gtk_layer_set_exclusive_zone(window, -1);
+        for (size_t i = 0; i < previews.size(); ++i) {
+            auto &preview = previews[i];
+            const int row = i / cols;
+            const int col = i % cols;
+            const auto winSize = preview.window->m_realSize->value();
+            const double scale = std::min((cellW * 0.94) / std::max(1.0, winSize.x),
+                                          (cellH * 0.9) / std::max(1.0, winSize.y));
+            const double w = std::max(1.0, winSize.x * scale);
+            const double h = std::max(1.0, winSize.y * scale);
+            const double x = margin + col * (cellW + gap) + (cellW - w) * hashUnit(seedFor(i), 0);
+            const double y = margin + row * (cellH + gap) + (cellH - h) * hashUnit(seedFor(i), 16);
 
-    for (auto edge : {GTK_LAYER_SHELL_EDGE_LEFT, GTK_LAYER_SHELL_EDGE_RIGHT,
-                      GTK_LAYER_SHELL_EDGE_TOP, GTK_LAYER_SHELL_EDGE_BOTTOM}) {
-        gtk_layer_set_anchor(window, edge, TRUE);
-    }
-}
-
-std::unique_ptr<SurfaceState> createSurface(GdkMonitor *monitor, size_t index) {
-    auto surface = std::make_unique<SurfaceState>();
-
-    GdkRectangle geometry{};
-    gdk_monitor_get_geometry(monitor, &geometry);
-    const char *model = gdk_monitor_get_model(monitor);
-
-    surface->monitorName = model ? model : ("monitor-" + std::to_string(index));
-    surface->hyprGeometry =
-        Rect{geometry.x, geometry.y, std::max(1, geometry.width), std::max(1, geometry.height)};
-
-    for (const auto &hyprMonitor : g_monitors) {
-        if (hyprMonitor.geometry.x == geometry.x && hyprMonitor.geometry.y == geometry.y) {
-            surface->monitorName = hyprMonitor.name;
-            surface->hyprGeometry = hyprMonitor.geometry;
-            break;
+            preview.box = {x, y, w, h};
+            preview.velocity = velocityFor(i);
         }
     }
 
-    surface->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(surface->window), "hypr-oled-saver");
-    gtk_window_set_decorated(GTK_WINDOW(surface->window), FALSE);
-    gtk_widget_set_app_paintable(surface->window, TRUE);
-    configureLayerWindow(GTK_WINDOW(surface->window), monitor);
+    uint64_t seedFor(size_t index) const {
+        const auto &preview = previews[index];
+        const auto klass = preview.window ? preview.window->m_class : "";
+        return hashString(std::to_string(index) + ":" + klass);
+    }
 
-    surface->area = gtk_drawing_area_new();
-    gtk_widget_set_hexpand(surface->area, TRUE);
-    gtk_widget_set_vexpand(surface->area, TRUE);
-    gtk_container_add(GTK_CONTAINER(surface->window), surface->area);
+    Vector2D velocityFor(size_t index) const {
+        const auto hash = seedFor(index);
+        const auto angle = hashUnit(hash, 0) * 2.0 * M_PI;
+        const auto speed = std::max(5.0F, *PSPEED()) * (0.65 + hashUnit(hash, 24) * 0.7);
+        return {std::cos(angle) * speed, std::sin(angle) * speed};
+    }
 
-    g_signal_connect(surface->area, "draw", G_CALLBACK(onDraw), surface.get());
-    g_signal_connect(surface->window, "destroy", G_CALLBACK(gtk_main_quit), nullptr);
+    void renderSnapshots() {
+        if (!pMonitor)
+            return;
 
-    gtk_widget_show_all(surface->window);
-    refreshSurfaceParticles(*surface);
+        Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        const auto format =
+            framebufferFormatWithAlpha(pMonitor->m_output->state->state().drmFormat);
 
-    g_timeout_add(FRAME_INTERVAL_MS, onFrame, surface.get());
-    return surface;
+        for (auto &preview : previews) {
+            if (!preview.window)
+                continue;
+
+            if (!preview.fb)
+                preview.fb = g_pHyprRenderer->createFB("hypr-oled-saver");
+
+            if (preview.fb->m_size != pMonitor->m_pixelSize) {
+                preview.fb->release();
+                preview.fb->alloc(pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y, format);
+            }
+
+            CRegion fakeDamage{0, 0, static_cast<double>((int)pMonitor->m_transformedSize.x),
+                               static_cast<double>((int)pMonitor->m_transformedSize.y)};
+            if (!g_pHyprRenderer->beginFullFakeRender(pMonitor.lock(), fakeDamage, preview.fb))
+                continue;
+
+            g_pHyprRenderer->m_bRenderingSnapshot = true;
+            g_pHyprRenderer->draw(CClearPassElement::SClearData{CHyprColor(0, 0, 0, 0)});
+            g_pHyprRenderer->startRenderPass();
+            g_pHyprRenderer->renderWindow(preview.window, pMonitor.lock(), Time::steadyNow(), false,
+                                          Render::RENDER_PASS_ALL, true, true);
+            g_pHyprRenderer->m_renderData.blockScreenShader = true;
+            g_pHyprRenderer->endRender();
+            g_pHyprRenderer->m_bRenderingSnapshot = false;
+        }
+    }
+
+    void stepPhysics() {
+        if (!pMonitor)
+            return;
+
+        const auto now = Time::steadyNow();
+        const double dt =
+            std::clamp(std::chrono::duration<double>(now - lastFrame).count(), 0.0, 0.05);
+        lastFrame = now;
+
+        for (auto &preview : previews) {
+            preview.box.x += preview.velocity.x * dt;
+            preview.box.y += preview.velocity.y * dt;
+            bounceOffBounds(preview);
+        }
+
+        resolveCollisions();
+    }
+
+    void bounceOffBounds(SPreview &preview) const {
+        if (preview.box.x < 0.0) {
+            preview.box.x = 0.0;
+            preview.velocity.x = std::abs(preview.velocity.x);
+        } else if (preview.box.x + preview.box.w > pMonitor->m_size.x) {
+            preview.box.x = pMonitor->m_size.x - preview.box.w;
+            preview.velocity.x = -std::abs(preview.velocity.x);
+        }
+
+        if (preview.box.y < 0.0) {
+            preview.box.y = 0.0;
+            preview.velocity.y = std::abs(preview.velocity.y);
+        } else if (preview.box.y + preview.box.h > pMonitor->m_size.y) {
+            preview.box.y = pMonitor->m_size.y - preview.box.h;
+            preview.velocity.y = -std::abs(preview.velocity.y);
+        }
+    }
+
+    void resolveCollisions() {
+        for (int pass = 0; pass < 4; ++pass) {
+            bool changed = false;
+
+            for (size_t i = 0; i < previews.size(); ++i) {
+                for (size_t j = i + 1; j < previews.size(); ++j) {
+                    if (!boxesOverlap(previews[i].box, previews[j].box))
+                        continue;
+
+                    resolveCollision(previews[i], previews[j]);
+                    changed = true;
+                }
+            }
+
+            if (!changed)
+                break;
+        }
+    }
+
+    void resolveCollision(SPreview &a, SPreview &b) const {
+        const double overlapX =
+            std::min(a.box.x + a.box.w, b.box.x + b.box.w) - std::max(a.box.x, b.box.x);
+        const double overlapY =
+            std::min(a.box.y + a.box.h, b.box.y + b.box.h) - std::max(a.box.y, b.box.y);
+
+        if (overlapX <= overlapY) {
+            const double direction =
+                (a.box.x + a.box.w / 2.0 <= b.box.x + b.box.w / 2.0) ? -1.0 : 1.0;
+            const double aSpeed = std::max(20.0, std::abs(a.velocity.x));
+            const double bSpeed = std::max(20.0, std::abs(b.velocity.x));
+            const double push = overlapX / 2.0 + 1.0;
+
+            a.box.x += direction * push;
+            b.box.x -= direction * push;
+            a.velocity.x = direction * bSpeed;
+            b.velocity.x = -direction * aSpeed;
+        } else {
+            const double direction =
+                (a.box.y + a.box.h / 2.0 <= b.box.y + b.box.h / 2.0) ? -1.0 : 1.0;
+            const double aSpeed = std::max(20.0, std::abs(a.velocity.y));
+            const double bSpeed = std::max(20.0, std::abs(b.velocity.y));
+            const double push = overlapY / 2.0 + 1.0;
+
+            a.box.y += direction * push;
+            b.box.y -= direction * push;
+            a.velocity.y = direction * bSpeed;
+            b.velocity.y = -direction * aSpeed;
+        }
+
+        clampBoxToBounds(a.box, pMonitor->m_size);
+        clampBoxToBounds(b.box, pMonitor->m_size);
+    }
+
+    std::vector<SPreview> previews;
+    std::chrono::steady_clock::time_point lastFrame;
+};
+
+static void failNotif(const std::string &reason) {
+    HyprlandAPI::addNotification(PHANDLE, "[hypr-oled-saver] Failure: " + reason,
+                                 CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
 }
 
-void createSurfaces() {
-    GdkDisplay *display = gdk_display_get_default();
-    if (!display)
-        return;
-
-    const int monitorCount = std::max(1, gdk_display_get_n_monitors(display));
-    for (int i = 0; i < monitorCount; ++i) {
-        GdkMonitor *monitor = gdk_display_get_monitor(display, i);
-        if (!monitor)
-            continue;
-        g_surfaces.push_back(createSurface(monitor, static_cast<size_t>(i)));
+static bool addConfigValue(SP<Config::Values::IValue> value) {
+    const auto ret = Config::mgr()->registerPluginValue(PHANDLE, value);
+    if (!ret) {
+        Log::logger->log(Log::ERR, "[hypr-oled-saver] failed to register plugin value \"{}\": {}",
+                         value->name(), ret.error());
+        return false;
     }
+
+    return true;
+}
+
+static void mustAddConfigValue(SP<Config::Values::IValue> value) {
+    if (!addConfigValue(std::move(value)))
+        throw std::runtime_error("[hypr-oled-saver] Failed to register plugin config value");
+}
+
+static SDispatchResult stopSaver() {
+    if (g_pOledSaver) {
+        g_pOledSaver.reset();
+        g_pHyprRenderer->m_renderPass.removeAllOfType("COledSaverPassElement");
+    }
+
+    return {};
+}
+
+static SDispatchResult startSaver() {
+    const auto monitor = Desktop::focusState()->monitor();
+    if (!monitor)
+        return {.success = false, .error = "no focused monitor"};
+
+    g_pOledSaver = std::make_unique<COledSaver>(monitor);
+    return {};
+}
+
+static SDispatchResult toggleSaver() {
+    if (g_pOledSaver)
+        return stopSaver();
+
+    return startSaver();
+}
+
+static SDispatchResult controlSaver(std::string arg) {
+    std::ranges::transform(arg, arg.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    if (arg.empty() || arg == "start" || arg == "on" || arg == "open")
+        return startSaver();
+
+    if (arg == "stop" || arg == "off" || arg == "close")
+        return stopSaver();
+
+    if (arg == "toggle")
+        return toggleSaver();
+
+    return {.success = false, .error = "unknown action: " + arg};
+}
+
+static SDispatchResult onDispatcher(std::string arg) {
+    return controlSaver(std::move(arg));
+}
+
+static SDispatchResult onStartDispatcher(std::string) {
+    return startSaver();
+}
+
+static SDispatchResult onStopDispatcher(std::string) {
+    return stopSaver();
+}
+
+static SDispatchResult onToggleDispatcher(std::string) {
+    return toggleSaver();
+}
+
+static int luaNoop(lua_State *) {
+    return 0;
+}
+
+static int luaControl(lua_State *L, const std::string &action) {
+    const auto result = controlSaver(action);
+    if (!result.success)
+        return luaL_error(L, "%s", result.error.c_str());
+
+    lua_pushcfunction(L, ::luaNoop);
+    return 1;
+}
+
+static int luaStart(lua_State *L) {
+    return luaControl(L, "start");
+}
+
+static int luaStop(lua_State *L) {
+    return luaControl(L, "stop");
+}
+
+static int luaToggle(lua_State *L) {
+    return luaControl(L, "toggle");
+}
+
+static int luaRun(lua_State *L) {
+    std::string arg = "toggle";
+
+    if (lua_gettop(L) >= 1 && !lua_isnil(L, 1)) {
+        if (!lua_isstring(L, 1))
+            return luaL_error(L, "hyproledsaver.run: argument must be a string");
+
+        arg = lua_tostring(L, 1);
+    }
+
+    return luaControl(L, arg);
+}
+
+static int luaEnabled(lua_State *L) {
+    lua_pushboolean(L, g_pOledSaver != nullptr);
+    return 1;
+}
+
+static int luaRefresh(lua_State *L) {
+    if (!g_pOledSaver)
+        return 0;
+
+    const auto result = startSaver();
+    if (!result.success)
+        return luaL_error(L, "%s", result.error.c_str());
+
+    return 0;
 }
 
 } // namespace
 
-int main(int argc, char **argv) {
-    if (argc > 1) {
-        const std::string arg = argv[1];
+APICALL EXPORT std::string PLUGIN_API_VERSION() {
+    return HYPRLAND_API_VERSION;
+}
 
-        if (arg == "--help" || arg == "-h") {
-            std::printf(
-                "Usage: hypr-oled-saver [--help] [--version]\n\n"
-                "Starts an OLED-friendly GTK layer-shell screensaver for Hyprland.\n"
-                "Stop it by terminating the process, for example: pkill -x hypr-oled-saver\n");
-            return 0;
-        }
+APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
+    PHANDLE = handle;
 
-        if (arg == "--version") {
-            std::printf("hypr-oled-saver %s\n", VERSION);
-            return 0;
-        }
+    const std::string hash = __hyprland_api_get_hash();
+    const std::string clientHash = __hyprland_api_get_client_hash();
+
+    if (hash != clientHash) {
+        failNotif("Version mismatch (headers ver is not equal to running Hyprland ver)");
+        throw std::runtime_error("[hypr-oled-saver] Version mismatch");
     }
 
-    gtk_init(&argc, &argv);
+    mustAddConfigValue(makeShared<Config::Values::CColorValue>("plugin:hyproledsaver:background",
+                                                               "background color", 0xFF000000));
+    mustAddConfigValue(makeShared<Config::Values::CColorValue>("plugin:hyproledsaver:border_color",
+                                                               "preview border color", 0x2246C7D8));
+    mustAddConfigValue(makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:border_size",
+                                                             "preview border size", 2));
+    mustAddConfigValue(makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:margin",
+                                                             "initial layout margin", 64));
+    mustAddConfigValue(makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:gap",
+                                                             "initial layout gap", 36));
+    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+        "plugin:hyproledsaver:speed", "preview velocity in logical px/s", 85.0F));
+    mustAddConfigValue(makeShared<Config::Values::CFloatValue>("plugin:hyproledsaver:opacity",
+                                                               "preview texture opacity", 0.82F));
 
-    refreshHyprlandState();
-    createSurfaces();
-    g_timeout_add(HYPR_REFRESH_MS, onRefresh, nullptr);
+    static auto renderStage = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
+        if (stage != RENDER_LAST_MOMENT || !g_pOledSaver)
+            return;
 
-    gtk_main();
-    return 0;
+        const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+        if (monitor && g_pOledSaver->pMonitor == monitor)
+            g_pOledSaver->render();
+    });
+
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaver", ::onDispatcher);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaverstart", ::onStartDispatcher);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsaverstop", ::onStopDispatcher);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hyproledsavertoggle", ::onToggleDispatcher);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "start", ::luaStart);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "stop", ::luaStop);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "toggle", ::luaToggle);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "run", ::luaRun);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "enabled", ::luaEnabled);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyproledsaver", "refresh", ::luaRefresh);
+    HyprlandAPI::reloadConfig();
+
+    HyprlandAPI::addNotification(PHANDLE, "[hypr-oled-saver] Initialized successfully",
+                                 CHyprColor{0.2, 1.0, 0.2, 1.0}, 5000);
+    return {"hypr-oled-saver", "An OLED-friendly Hyprland screensaver plugin", "Ivan Malison",
+            "0.1.0"};
+}
+
+APICALL EXPORT void PLUGIN_EXIT() {
+    g_pOledSaver.reset();
+    g_pHyprRenderer->m_renderPass.removeAllOfType("COledSaverPassElement");
 }

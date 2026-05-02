@@ -1,15 +1,17 @@
 # hypr-oled-saver
 
-`hypr-oled-saver` is a small OLED-friendly layer-shell screensaver for Hyprland.
-It renders mostly black surfaces, a dim drifting clock, and moving window glyphs
-derived from the open Hyprland clients across workspaces.
+`hypr-oled-saver` is an OLED-friendly Hyprland plugin screensaver.
+
+It renders a black compositor overlay and animated live previews of open
+Hyprland windows. Previews start in a non-overlapping grid, then bounce around
+the monitor and collide with each other.
 
 This is an idle visual, not a lock screen. Use `hyprlock` for locking.
 
-## Running
+## Build
 
 ```sh
-nix run github:colonelpanic8/hypr-oled-saver
+nix build
 ```
 
 For local development:
@@ -18,19 +20,62 @@ For local development:
 direnv allow
 cmake -S . -B build
 cmake --build build
-./build/hypr-oled-saver
+```
+
+## Hyprland
+
+Load the built plugin from Hyprland, then use the dispatcher:
+
+```conf
+exec-once = hyprctl plugin load /path/to/hypr-oled-saver.so
+
+bind = SUPER, O, hyproledsaver, toggle
+```
+
+Dispatcher actions:
+
+```sh
+hyprctl dispatch hyproledsaver start
+hyprctl dispatch hyproledsaver stop
+hyprctl dispatch hyproledsaver toggle
+```
+
+If your Hyprland config layer has trouble passing dispatcher arguments, the
+plugin also registers no-argument dispatchers:
+
+```sh
+hyprctl dispatch hyproledsaverstart
+hyprctl dispatch hyproledsaverstop
+hyprctl dispatch hyproledsavertoggle
+```
+
+Lua-based Hyprland configs can call the plugin directly:
+
+```lua
+hl.plugin.hyproledsaver.start()
+hl.plugin.hyproledsaver.stop()
+hl.plugin.hyproledsaver.toggle()
+```
+
+Config values use the `hyproledsaver` plugin namespace:
+
+```conf
+plugin:hyproledsaver:background = rgba(000000ff)
+plugin:hyproledsaver:border_color = rgba(46c7d822)
+plugin:hyproledsaver:border_size = 2
+plugin:hyproledsaver:margin = 64
+plugin:hyproledsaver:gap = 36
+plugin:hyproledsaver:speed = 85.0
+plugin:hyproledsaver:opacity = 0.82
 ```
 
 ## Hypridle
 
-Use a wrapper that starts the process on timeout and kills it on resume, or wire
-it into an existing screensaver script.
-
 ```conf
 listener {
     timeout = 300
-    on-timeout = hypr-oled-saver
-    on-resume = pkill -x hypr-oled-saver
+    on-timeout = hyprctl dispatch hyproledsaverstart
+    on-resume = hyprctl dispatch hyproledsaverstop
 }
 
 listener {
@@ -42,10 +87,8 @@ listener {
 
 ## Notes
 
-- Uses `gtk-layer-shell` to cover each monitor with an overlay-layer surface.
-- Queries `hyprctl -j monitors` and `hyprctl -j clients`.
-- A standalone Wayland layer-shell client can render Hyprland window metadata, but
-  it cannot render real window contents from inactive workspaces. Real live
-  thumbnails require a compositor-side Hyprland plugin/render-pass design.
-- Falls back to synthetic particles outside Hyprland.
-- Keeps brightness low by design; the default background is pure black.
+- Uses Hyprland's compositor internals to snapshot window contents.
+- Starts previews in a non-overlapping grid before allowing full-screen motion.
+- Keeps the background pure black for OLED friendliness.
+- The old standalone GTK layer-shell prototype is kept in `src/standalone.cpp`
+  for reference, but the primary build artifact is now the Hyprland plugin.
