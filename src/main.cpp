@@ -23,6 +23,7 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
@@ -37,6 +38,7 @@ namespace {
 
 class COledSaver;
 inline std::unique_ptr<COledSaver> g_pOledSaver;
+inline bool g_dismissAfterActivity = false;
 
 static const CConfigValue<Config::INTEGER> &PBACKGROUND() {
     static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:background");
@@ -70,6 +72,16 @@ static const CConfigValue<Config::FLOAT> &PSPEED() {
 
 static const CConfigValue<Config::FLOAT> &POPACITY() {
     static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:opacity");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PDISMISSONACTIVITY() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:dismiss_on_activity");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PACTIVITYGRACEMS() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:activity_grace_ms");
     return VALUE;
 }
 
@@ -122,6 +134,8 @@ class COledSaver {
   public:
     explicit COledSaver(PHLMONITOR monitor) : pMonitor(monitor) {
         lastFrame = Time::steadyNow();
+        activatedAt = lastFrame;
+        installActivityHooks();
         refreshWindows();
         damage();
     }
@@ -224,6 +238,40 @@ class COledSaver {
             return EK_CUSTOM;
         }
     };
+
+    void installActivityHooks() {
+        auto onActivity = [this](Event::SCallbackInfo &info) { handleActivity(info); };
+
+        mouseMoveHook = Event::bus()->m_events.input.mouse.move.listen(
+            [onActivity](Vector2D, Event::SCallbackInfo &info) { onActivity(info); });
+        mouseButtonHook = Event::bus()->m_events.input.mouse.button.listen(
+            [onActivity](IPointer::SButtonEvent, Event::SCallbackInfo &info) { onActivity(info); });
+        touchMoveHook = Event::bus()->m_events.input.touch.motion.listen(
+            [onActivity](ITouch::SMotionEvent, Event::SCallbackInfo &info) { onActivity(info); });
+        touchDownHook = Event::bus()->m_events.input.touch.down.listen(
+            [onActivity](ITouch::SDownEvent, Event::SCallbackInfo &info) { onActivity(info); });
+        keyboardHook = Event::bus()->m_events.input.keyboard.key.listen(
+            [onActivity](IKeyboard::SKeyEvent, Event::SCallbackInfo &info) { onActivity(info); });
+    }
+
+    void handleActivity(Event::SCallbackInfo &info) {
+        if (!shouldDismissForActivity())
+            return;
+
+        info.cancelled = true;
+        g_dismissAfterActivity = true;
+        damage();
+    }
+
+    bool shouldDismissForActivity() const {
+        if (*PDISMISSONACTIVITY() == 0)
+            return false;
+
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Time::steadyNow() - activatedAt)
+                .count();
+        return elapsed >= std::max<Config::INTEGER>(0, *PACTIVITYGRACEMS());
+    }
 
     void refreshWindows() {
         previews.clear();
@@ -419,6 +467,12 @@ class COledSaver {
 
     std::vector<SPreview> previews;
     std::chrono::steady_clock::time_point lastFrame;
+    std::chrono::steady_clock::time_point activatedAt;
+    CHyprSignalListener mouseMoveHook;
+    CHyprSignalListener mouseButtonHook;
+    CHyprSignalListener keyboardHook;
+    CHyprSignalListener touchMoveHook;
+    CHyprSignalListener touchDownHook;
 };
 
 static void failNotif(const std::string &reason) {
@@ -448,6 +502,7 @@ static SDispatchResult stopSaver() {
         g_pHyprRenderer->m_renderPass.removeAllOfType("COledSaverPassElement");
     }
 
+    g_dismissAfterActivity = false;
     return {};
 }
 
@@ -637,10 +692,19 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         "plugin:hyproledsaver:speed", "preview velocity in logical px/s", 85.0F));
     mustAddConfigValue(makeShared<Config::Values::CFloatValue>("plugin:hyproledsaver:opacity",
                                                                "preview texture opacity", 0.82F));
+    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+        "plugin:hyproledsaver:dismiss_on_activity", "dismiss when input activity is detected", 1));
+    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+        "plugin:hyproledsaver:activity_grace_ms", "activity ignore window after activation", 500));
 
     static auto renderStage = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
         if (stage != RENDER_LAST_MOMENT || !g_pOledSaver)
             return;
+
+        if (g_dismissAfterActivity) {
+            stopSaver();
+            return;
+        }
 
         const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
         if (monitor && g_pOledSaver->pMonitor == monitor)

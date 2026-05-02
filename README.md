@@ -92,6 +92,8 @@ plugin:hyproledsaver:margin = 64
 plugin:hyproledsaver:gap = 36
 plugin:hyproledsaver:speed = 85.0
 plugin:hyproledsaver:opacity = 0.82
+plugin:hyproledsaver:dismiss_on_activity = 1
+plugin:hyproledsaver:activity_grace_ms = 500
 ```
 
 ## Hypridle
@@ -100,6 +102,11 @@ The plugin intentionally does not own idle policy. Use the plugin API for
 manual state changes and `hypridle` for idle/resume triggers. Keeping idle
 timing in `hypridle` avoids duplicating lock/DPMS/inhibitor logic inside the
 plugin.
+
+Manual activation still dismisses on activity by default. The plugin listens for
+keyboard, pointer, and touch input while active, ignores activity for
+`activity_grace_ms` after activation, then dismisses itself and consumes the
+wake input.
 
 ```conf
 listener {
