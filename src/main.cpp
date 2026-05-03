@@ -682,11 +682,6 @@ static bool addConfigValue(SP<Config::Values::IValue> value) {
     return true;
 }
 
-static void mustAddConfigValue(SP<Config::Values::IValue> value) {
-    if (!addConfigValue(std::move(value)))
-        throw std::runtime_error("[hypr-oled-saver] Failed to register plugin config value");
-}
-
 static SDispatchResult stopSaver() {
     if (g_pOledSaver) {
         g_pOledSaver.reset();
@@ -870,42 +865,42 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("[hypr-oled-saver] Version mismatch");
     }
 
-    mustAddConfigValue(makeShared<Config::Values::CColorValue>("plugin:hyproledsaver:background",
-                                                               "background color", 0xFF000000));
-    mustAddConfigValue(makeShared<Config::Values::CColorValue>("plugin:hyproledsaver:border_color",
-                                                               "preview border color", 0x2246C7D8));
-    mustAddConfigValue(makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:border_size",
-                                                             "preview border size", 2));
-    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+    addConfigValue(makeShared<Config::Values::CColorValue>("plugin:hyproledsaver:background",
+                                                           "background color", 0xFF000000));
+    addConfigValue(makeShared<Config::Values::CColorValue>("plugin:hyproledsaver:border_color",
+                                                           "preview border color", 0x2246C7D8));
+    addConfigValue(makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:border_size",
+                                                         "preview border size", 2));
+    addConfigValue(makeShared<Config::Values::CFloatValue>(
         "plugin:hyproledsaver:opacity", "maximum preview texture opacity", 0.34F));
-    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+    addConfigValue(makeShared<Config::Values::CIntValue>(
         "plugin:hyproledsaver:max_visible", "maximum simultaneously visible previews", 2));
-    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+    addConfigValue(makeShared<Config::Values::CFloatValue>(
         "plugin:hyproledsaver:target_window_area", "target fraction of monitor area per preview",
         0.34F));
-    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+    addConfigValue(makeShared<Config::Values::CFloatValue>(
         "plugin:hyproledsaver:min_window_scale", "minimum scale relative to real window size",
         0.55F));
-    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+    addConfigValue(makeShared<Config::Values::CFloatValue>(
         "plugin:hyproledsaver:max_window_scale", "maximum scale relative to real window size",
         0.94F));
-    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+    addConfigValue(makeShared<Config::Values::CIntValue>(
         "plugin:hyproledsaver:path_duration_ms_min", "minimum Bezier path duration", 35000));
-    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+    addConfigValue(makeShared<Config::Values::CIntValue>(
         "plugin:hyproledsaver:path_duration_ms_max", "maximum Bezier path duration", 70000));
-    mustAddConfigValue(
+    addConfigValue(
         makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:start_stagger_ms_min",
                                               "minimum stagger between preview starts", 2500));
-    mustAddConfigValue(
+    addConfigValue(
         makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:start_stagger_ms_max",
                                               "maximum stagger between preview starts", 9000));
-    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+    addConfigValue(makeShared<Config::Values::CFloatValue>(
         "plugin:hyproledsaver:curve_strength", "Bezier control-point bend strength", 0.28F));
-    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+    addConfigValue(makeShared<Config::Values::CFloatValue>(
         "plugin:hyproledsaver:path_accel_power", "Bezier path acceleration power", 1.35F));
-    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+    addConfigValue(makeShared<Config::Values::CIntValue>(
         "plugin:hyproledsaver:dismiss_on_activity", "dismiss when input activity is detected", 1));
-    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+    addConfigValue(makeShared<Config::Values::CIntValue>(
         "plugin:hyproledsaver:activity_grace_ms", "activity ignore window after activation", 500));
 
     static auto renderStage = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
