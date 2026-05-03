@@ -108,6 +108,9 @@ keyboard, pointer, and touch input while active, ignores activity for
 `activity_grace_ms` after activation, then dismisses itself and consumes the
 wake input.
 
+For development, `Escape` and right click always dismiss immediately, bypassing
+the activation grace period.
+
 ```conf
 listener {
     timeout = 300

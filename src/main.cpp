@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <drm_fourcc.h>
+#include <linux/input-event-codes.h>
 #include <lua.hpp>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
+#include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
@@ -31,6 +33,7 @@
 #include <hyprland/src/render/pass/PassElement.hpp>
 #undef private
 #undef protected
+#include <xkbcommon/xkbcommon.h>
 
 inline HANDLE PHANDLE = nullptr;
 
@@ -245,19 +248,37 @@ class COledSaver {
         mouseMoveHook = Event::bus()->m_events.input.mouse.move.listen(
             [onActivity](Vector2D, Event::SCallbackInfo &info) { onActivity(info); });
         mouseButtonHook = Event::bus()->m_events.input.mouse.button.listen(
-            [onActivity](IPointer::SButtonEvent, Event::SCallbackInfo &info) { onActivity(info); });
+            [this](IPointer::SButtonEvent event, Event::SCallbackInfo &info) {
+                handlePointerButton(event, info);
+            });
         touchMoveHook = Event::bus()->m_events.input.touch.motion.listen(
             [onActivity](ITouch::SMotionEvent, Event::SCallbackInfo &info) { onActivity(info); });
         touchDownHook = Event::bus()->m_events.input.touch.down.listen(
             [onActivity](ITouch::SDownEvent, Event::SCallbackInfo &info) { onActivity(info); });
         keyboardHook = Event::bus()->m_events.input.keyboard.key.listen(
-            [onActivity](IKeyboard::SKeyEvent, Event::SCallbackInfo &info) { onActivity(info); });
+            [this](IKeyboard::SKeyEvent event, Event::SCallbackInfo &info) {
+                handleKeyboard(event, info);
+            });
     }
 
     void handleActivity(Event::SCallbackInfo &info) {
         if (!shouldDismissForActivity())
             return;
 
+        dismissFromInput(info);
+    }
+
+    void handlePointerButton(const IPointer::SButtonEvent &event, Event::SCallbackInfo &info) {
+        if (isEmergencyPointerButton(event) || shouldDismissForActivity())
+            dismissFromInput(info);
+    }
+
+    void handleKeyboard(const IKeyboard::SKeyEvent &event, Event::SCallbackInfo &info) {
+        if (isEmergencyKey(event) || shouldDismissForActivity())
+            dismissFromInput(info);
+    }
+
+    void dismissFromInput(Event::SCallbackInfo &info) {
         info.cancelled = true;
         g_dismissAfterActivity = true;
         damage();
@@ -271,6 +292,24 @@ class COledSaver {
             std::chrono::duration_cast<std::chrono::milliseconds>(Time::steadyNow() - activatedAt)
                 .count();
         return elapsed >= std::max<Config::INTEGER>(0, *PACTIVITYGRACEMS());
+    }
+
+    bool isEmergencyPointerButton(const IPointer::SButtonEvent &event) const {
+        return event.state == WL_POINTER_BUTTON_STATE_PRESSED && event.button == BTN_RIGHT;
+    }
+
+    bool isEmergencyKey(const IKeyboard::SKeyEvent &event) const {
+        if (event.state != WL_KEYBOARD_KEY_STATE_PRESSED)
+            return false;
+
+        const auto keyboard = g_pSeatManager && !g_pSeatManager->m_keyboard.expired()
+                                  ? g_pSeatManager->m_keyboard.lock()
+                                  : nullptr;
+        if (!keyboard || !keyboard->m_xkbState)
+            return false;
+
+        const auto keycode = event.keycode + 8;
+        return xkb_state_key_get_one_sym(keyboard->m_xkbState, keycode) == XKB_KEY_Escape;
     }
 
     void refreshWindows() {
