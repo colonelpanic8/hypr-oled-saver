@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -58,23 +59,58 @@ static const CConfigValue<Config::INTEGER> &PBORDERSIZE() {
     return VALUE;
 }
 
-static const CConfigValue<Config::INTEGER> &PMARGIN() {
-    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:margin");
-    return VALUE;
-}
-
-static const CConfigValue<Config::INTEGER> &PGAP() {
-    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:gap");
-    return VALUE;
-}
-
-static const CConfigValue<Config::FLOAT> &PSPEED() {
-    static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:speed");
-    return VALUE;
-}
-
 static const CConfigValue<Config::FLOAT> &POPACITY() {
     static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:opacity");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PMAXVISIBLE() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:max_visible");
+    return VALUE;
+}
+
+static const CConfigValue<Config::FLOAT> &PTARGETWINDOWAREA() {
+    static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:target_window_area");
+    return VALUE;
+}
+
+static const CConfigValue<Config::FLOAT> &PMINWINDOWSCALE() {
+    static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:min_window_scale");
+    return VALUE;
+}
+
+static const CConfigValue<Config::FLOAT> &PMAXWINDOWSCALE() {
+    static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:max_window_scale");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PPATHDURATIONMIN() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:path_duration_ms_min");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PPATHDURATIONMAX() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:path_duration_ms_max");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PSTARTSTAGGERMIN() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:start_stagger_ms_min");
+    return VALUE;
+}
+
+static const CConfigValue<Config::INTEGER> &PSTARTSTAGGERMAX() {
+    static const CConfigValue<Config::INTEGER> VALUE("plugin:hyproledsaver:start_stagger_ms_max");
+    return VALUE;
+}
+
+static const CConfigValue<Config::FLOAT> &PCURVESTRENGTH() {
+    static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:curve_strength");
+    return VALUE;
+}
+
+static const CConfigValue<Config::FLOAT> &PPATHACCELPOWER() {
+    static const CConfigValue<Config::FLOAT> VALUE("plugin:hyproledsaver:path_accel_power");
     return VALUE;
 }
 
@@ -101,8 +137,37 @@ static uint64_t hashString(const std::string &value) {
     return hash;
 }
 
-static double hashUnit(uint64_t hash, int shift) {
-    return static_cast<double>((hash >> shift) & 0xffff) / 65535.0;
+static uint64_t mixHash(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+static double randomUnit(uint64_t seed, uint64_t salt) {
+    return static_cast<double>(mixHash(seed + salt * 0x9e3779b97f4a7c15ULL) >> 11) *
+           (1.0 / 9007199254740992.0);
+}
+
+static double randomRange(uint64_t seed, uint64_t salt, double min, double max) {
+    return min + (max - min) * randomUnit(seed, salt);
+}
+
+static int randomRangeInt(uint64_t seed, uint64_t salt, int min, int max) {
+    if (max <= min)
+        return min;
+    return min + (int)std::round(randomUnit(seed, salt) * (max - min));
+}
+
+static double smoothstep(double edge0, double edge1, double value) {
+    const double t = std::clamp((value - edge0) / std::max(0.0001, edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+static double distance(const Vector2D &a, const Vector2D &b) {
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    return std::sqrt(dx * dx + dy * dy);
 }
 
 static bool previewableWindow(const PHLWINDOW &window) {
@@ -117,27 +182,32 @@ static bool previewableWindow(const PHLWINDOW &window) {
     return true;
 }
 
-static void clampBoxToBounds(CBox &box, const Vector2D &size) {
-    box.x = std::clamp(box.x, 0.0, std::max(0.0, size.x - box.w));
-    box.y = std::clamp(box.y, 0.0, std::max(0.0, size.y - box.h));
-}
-
-static bool boxesOverlap(const CBox &a, const CBox &b) {
-    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
-
 struct SPreview {
     PHLWINDOW window;
     SP<Render::IFramebuffer> fb;
     CBox box;
-    Vector2D velocity;
+    int slot = -1;
+    bool visible = false;
+    std::chrono::steady_clock::time_point pathStartedAt;
+    int durationMs = 1;
+    double opacity = 0.0;
+
+    struct SPath {
+        Vector2D p0;
+        Vector2D p1;
+        Vector2D p2;
+        Vector2D p3;
+        std::array<double, 49> cumulative = {};
+    } path;
 };
 
 class COledSaver {
   public:
     explicit COledSaver(PHLMONITOR monitor) : pMonitor(monitor) {
-        lastFrame = Time::steadyNow();
-        activatedAt = lastFrame;
+        activatedAt = Time::steadyNow();
+        pathGeneration = mixHash((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     activatedAt.time_since_epoch())
+                                     .count());
         installActivityHooks();
         refreshWindows();
         damage();
@@ -158,7 +228,7 @@ class COledSaver {
         if (!pMonitor)
             return;
 
-        stepPhysics();
+        updatePaths();
 
         CRegion fullDamage = {0, 0, INT16_MAX, INT16_MAX};
         Render::GL::g_pHyprOpenGL->renderRect(CBox{{0, 0}, pMonitor->m_pixelSize},
@@ -166,10 +236,10 @@ class COledSaver {
 
         const double scale = pMonitor->m_scale;
         const int border = std::max<Config::INTEGER>(0, *PBORDERSIZE());
-        const float opacity = std::clamp<float>(*POPACITY(), 0.05F, 1.0F);
 
         for (auto &preview : previews) {
-            if (!preview.window || !preview.fb || !preview.fb->getTexture())
+            if (!preview.visible || preview.opacity <= 0.001 || !preview.window || !preview.fb ||
+                !preview.fb->getTexture())
                 continue;
 
             CBox tilePx = preview.box.copy().scale(scale).round();
@@ -190,7 +260,7 @@ class COledSaver {
             g_pHyprRenderer->m_renderData.clipBox = tilePx;
             Render::GL::g_pHyprOpenGL->renderTexture(
                 preview.fb->getTexture(), texBox,
-                {.damage = &fullDamage, .a = opacity, .round = border * 2});
+                {.damage = &fullDamage, .a = (float)preview.opacity, .round = border * 2});
             g_pHyprRenderer->m_renderData.clipBox = {};
         }
 
@@ -324,46 +394,126 @@ class COledSaver {
         }
 
         std::ranges::reverse(previews);
-        layoutInitialGrid();
         renderSnapshots();
+        initializePaths();
     }
 
-    void layoutInitialGrid() {
+    void initializePaths() {
         if (!pMonitor || previews.empty())
             return;
 
-        const double count = previews.size();
-        const double aspect = std::max(0.1, pMonitor->m_size.x / std::max(1.0, pMonitor->m_size.y));
-        int cols = std::max(1, (int)std::ceil(std::sqrt(count * aspect)));
-        int rows = std::max(1, (int)std::ceil(count / cols));
+        nextPreviewIndex =
+            (size_t)std::floor(randomRange(pathGeneration, 0, 0.0, (double)previews.size()));
+        const int visibleCount =
+            std::min<int>(std::max<Config::INTEGER>(1, *PMAXVISIBLE()), previews.size());
 
-        while (cols > 1 && (cols - 1) * rows >= (int)previews.size())
-            cols--;
+        for (int slot = 0; slot < visibleCount; ++slot)
+            scheduleNextPreview(slot, Time::steadyNow(), initialDelayForSlot(slot));
+    }
 
-        rows = std::max(1, (int)std::ceil(count / cols));
+    void updatePaths() {
+        if (!pMonitor || previews.empty())
+            return;
 
-        const double margin = std::max<Config::INTEGER>(0, *PMARGIN());
-        const double gap = std::max<Config::INTEGER>(0, *PGAP());
-        const double areaW = std::max(1.0, pMonitor->m_size.x - margin * 2.0);
-        const double areaH = std::max(1.0, pMonitor->m_size.y - margin * 2.0);
-        const double cellW = (areaW - gap * (cols - 1)) / cols;
-        const double cellH = (areaH - gap * (rows - 1)) / rows;
+        const auto now = Time::steadyNow();
+        std::vector<int> finishedSlots;
 
-        for (size_t i = 0; i < previews.size(); ++i) {
-            auto &preview = previews[i];
-            const int row = i / cols;
-            const int col = i % cols;
-            const auto winSize = preview.window->m_realSize->value();
-            const double scale = std::min((cellW * 0.94) / std::max(1.0, winSize.x),
-                                          (cellH * 0.9) / std::max(1.0, winSize.y));
-            const double w = std::max(1.0, winSize.x * scale);
-            const double h = std::max(1.0, winSize.y * scale);
-            const double x = margin + col * (cellW + gap) + (cellW - w) * hashUnit(seedFor(i), 0);
-            const double y = margin + row * (cellH + gap) + (cellH - h) * hashUnit(seedFor(i), 16);
+        for (auto &preview : previews) {
+            if (!preview.visible)
+                continue;
 
-            preview.box = {x, y, w, h};
-            preview.velocity = velocityFor(i);
+            const double localMs = (double)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       now - preview.pathStartedAt)
+                                       .count();
+
+            if (localMs < 0.0) {
+                preview.opacity = 0.0;
+                continue;
+            }
+
+            const double progress = localMs / std::max(1.0, (double)preview.durationMs);
+            if (progress >= 1.0) {
+                finishedSlots.push_back(preview.slot);
+                preview.visible = false;
+                preview.slot = -1;
+                preview.opacity = 0.0;
+                continue;
+            }
+
+            const double distanceProgress = std::pow(
+                std::clamp(progress, 0.0, 1.0), std::clamp<double>(*PPATHACCELPOWER(), 0.25, 4.0));
+            const double pathT = parameterAtDistance(preview.path, distanceProgress);
+            const auto center = cubicBezier(preview.path, pathT);
+            preview.box.x = center.x - preview.box.w / 2.0;
+            preview.box.y = center.y - preview.box.h / 2.0;
+            preview.opacity = opacityForProgress(progress);
         }
+
+        for (const auto slot : finishedSlots)
+            scheduleNextPreview(slot, now, nextDelayForSlot(slot));
+    }
+
+    double opacityForProgress(double progress) const {
+        const double fadeIn = smoothstep(0.04, 0.24, progress);
+        const double fadeOut = 1.0 - smoothstep(0.68, 0.96, progress);
+        return std::clamp<double>(*POPACITY(), 0.0, 1.0) * fadeIn * fadeOut;
+    }
+
+    int initialDelayForSlot(int slot) const {
+        if (slot == 0)
+            return 0;
+
+        return nextDelayForSlot(slot);
+    }
+
+    int nextDelayForSlot(int slot) const {
+        const auto seed = mixHash(pathGeneration ^ hashString("delay:" + std::to_string(slot)));
+        const int minDelay = std::max<Config::INTEGER>(0, *PSTARTSTAGGERMIN());
+        const int maxDelay = std::max<Config::INTEGER>(minDelay, *PSTARTSTAGGERMAX());
+        return randomRangeInt(seed, 0, minDelay, maxDelay);
+    }
+
+    void scheduleNextPreview(int slot, std::chrono::steady_clock::time_point now, int delayMs) {
+        if (previews.empty())
+            return;
+
+        const auto index = nextInactivePreviewIndex();
+        auto &preview = previews[index];
+        preview.visible = true;
+        preview.slot = slot;
+        preview.opacity = 0.0;
+        preview.durationMs = pathDurationFor(index, slot);
+        preview.pathStartedAt = now + std::chrono::milliseconds(delayMs);
+        preview.box = sizedBoxForWindow(preview.window);
+        preview.path = pathFor(preview, index, slot);
+        buildArcLength(preview.path);
+    }
+
+    size_t nextInactivePreviewIndex() {
+        for (size_t attempts = 0; attempts < previews.size(); ++attempts) {
+            const size_t index = nextPreviewIndex % previews.size();
+            nextPreviewIndex = (nextPreviewIndex + 1) % previews.size();
+            if (!previews[index].visible)
+                return index;
+        }
+
+        const size_t index = nextPreviewIndex % previews.size();
+        nextPreviewIndex = (nextPreviewIndex + 1) % previews.size();
+        return index;
+    }
+
+    CBox sizedBoxForWindow(const PHLWINDOW &window) const {
+        const auto winSize = window->m_realSize->value();
+        const double monitorArea = std::max(1.0, pMonitor->m_size.x * pMonitor->m_size.y);
+        const double targetArea = monitorArea * std::clamp<double>(*PTARGETWINDOWAREA(), 0.04, 0.9);
+        const double rawScale = std::sqrt(targetArea / std::max(1.0, winSize.x * winSize.y));
+        const double minScale = std::clamp<double>(*PMINWINDOWSCALE(), 0.05, 4.0);
+        const double maxScale =
+            std::max(minScale, std::clamp<double>(*PMAXWINDOWSCALE(), 0.05, 4.0));
+        const double windowScale = std::clamp(rawScale, minScale, maxScale);
+        const double w = std::max(1.0, winSize.x * windowScale);
+        const double h = std::max(1.0, winSize.y * windowScale);
+        return {0, 0, w, h};
     }
 
     uint64_t seedFor(size_t index) const {
@@ -372,11 +522,101 @@ class COledSaver {
         return hashString(std::to_string(index) + ":" + klass);
     }
 
-    Vector2D velocityFor(size_t index) const {
-        const auto hash = seedFor(index);
-        const auto angle = hashUnit(hash, 0) * 2.0 * M_PI;
-        const auto speed = std::max(5.0F, *PSPEED()) * (0.65 + hashUnit(hash, 24) * 0.7);
-        return {std::cos(angle) * speed, std::sin(angle) * speed};
+    int pathDurationFor(size_t index, int slot) const {
+        const int minDuration = std::max<Config::INTEGER>(1000, *PPATHDURATIONMIN());
+        const int maxDuration = std::max<Config::INTEGER>(minDuration, *PPATHDURATIONMAX());
+        return randomRangeInt(pathSeed(index, slot), 1, minDuration, maxDuration);
+    }
+
+    uint64_t pathSeed(size_t index, int slot) const {
+        return mixHash(seedFor(index) ^ ((uint64_t)slot << 32) ^ pathGeneration);
+    }
+
+    SPreview::SPath pathFor(const SPreview &preview, size_t index, int slot) {
+        const auto seed = pathSeed(index, slot);
+        const bool leftToRight = slot % 2 == 0;
+        const auto size = pMonitor->m_size;
+        const double halfW = preview.box.w / 2.0;
+        const double halfH = preview.box.h / 2.0;
+        const double startX = leftToRight ? -halfW * 0.55 : size.x + halfW * 0.55;
+        const double endX = leftToRight ? size.x + halfW * 0.55 : -halfW * 0.55;
+        const double minY = std::clamp(halfH * 0.85, 0.0, size.y);
+        const double maxY = std::clamp(size.y - halfH * 0.85, minY, size.y);
+        const double startY = randomRange(seed, 2, minY, maxY);
+        const double endY = randomRange(seed, 3, minY, maxY);
+
+        SPreview::SPath path;
+        path.p0 = {startX, startY};
+        path.p3 = {endX, endY};
+
+        const double length = std::max(1.0, distance(path.p0, path.p3));
+        const Vector2D direction = {(path.p3.x - path.p0.x) / length,
+                                    (path.p3.y - path.p0.y) / length};
+        const Vector2D normal = {-direction.y, direction.x};
+        const double bendSign = slot % 2 == 0 ? 1.0 : -1.0;
+        const double strength = std::clamp<double>(*PCURVESTRENGTH(), 0.02, 0.8) *
+                                std::min(length, std::max(size.x, size.y));
+        const double bend1 = bendSign * randomRange(seed, 4, 0.45, 1.0) * strength;
+        const double bend2Sign = randomUnit(seed, 5) < 0.75 ? bendSign : -bendSign;
+        const double bend2 = bend2Sign * randomRange(seed, 6, 0.45, 1.0) * strength;
+        const double p1Distance = randomRange(seed, 7, 0.22, 0.38);
+        const double p2Distance = randomRange(seed, 8, 0.62, 0.82);
+
+        path.p1 = {path.p0.x + direction.x * length * p1Distance + normal.x * bend1,
+                   path.p0.y + direction.y * length * p1Distance + normal.y * bend1};
+        path.p2 = {path.p0.x + direction.x * length * p2Distance + normal.x * bend2,
+                   path.p0.y + direction.y * length * p2Distance + normal.y * bend2};
+
+        pathGeneration = mixHash(pathGeneration + 1);
+        return path;
+    }
+
+    static Vector2D cubicBezier(const SPreview::SPath &path, double t) {
+        const double inv = 1.0 - t;
+        const double b0 = inv * inv * inv;
+        const double b1 = 3.0 * inv * inv * t;
+        const double b2 = 3.0 * inv * t * t;
+        const double b3 = t * t * t;
+        return {path.p0.x * b0 + path.p1.x * b1 + path.p2.x * b2 + path.p3.x * b3,
+                path.p0.y * b0 + path.p1.y * b1 + path.p2.y * b2 + path.p3.y * b3};
+    }
+
+    static void buildArcLength(SPreview::SPath &path) {
+        path.cumulative[0] = 0.0;
+        Vector2D previous = path.p0;
+        double total = 0.0;
+
+        for (size_t i = 1; i < path.cumulative.size(); ++i) {
+            const double t = (double)i / (double)(path.cumulative.size() - 1);
+            const auto current = cubicBezier(path, t);
+            total += distance(previous, current);
+            path.cumulative[i] = total;
+            previous = current;
+        }
+
+        if (total <= 0.0)
+            return;
+
+        for (auto &value : path.cumulative)
+            value /= total;
+    }
+
+    static double parameterAtDistance(const SPreview::SPath &path, double distanceProgress) {
+        const double target = std::clamp(distanceProgress, 0.0, 1.0);
+        const auto upper = std::ranges::lower_bound(path.cumulative, target);
+        if (upper == path.cumulative.begin())
+            return 0.0;
+        if (upper == path.cumulative.end())
+            return 1.0;
+
+        const size_t upperIndex = upper - path.cumulative.begin();
+        const size_t lowerIndex = upperIndex - 1;
+        const double lowerValue = path.cumulative[lowerIndex];
+        const double upperValue = path.cumulative[upperIndex];
+        const double local = (target - lowerValue) / std::max(0.000001, upperValue - lowerValue);
+        const double lowerT = (double)lowerIndex / (double)(path.cumulative.size() - 1);
+        const double upperT = (double)upperIndex / (double)(path.cumulative.size() - 1);
+        return lowerT + (upperT - lowerT) * local;
     }
 
     void renderSnapshots() {
@@ -415,98 +655,10 @@ class COledSaver {
         }
     }
 
-    void stepPhysics() {
-        if (!pMonitor)
-            return;
-
-        const auto now = Time::steadyNow();
-        const double dt =
-            std::clamp(std::chrono::duration<double>(now - lastFrame).count(), 0.0, 0.05);
-        lastFrame = now;
-
-        for (auto &preview : previews) {
-            preview.box.x += preview.velocity.x * dt;
-            preview.box.y += preview.velocity.y * dt;
-            bounceOffBounds(preview);
-        }
-
-        resolveCollisions();
-    }
-
-    void bounceOffBounds(SPreview &preview) const {
-        if (preview.box.x < 0.0) {
-            preview.box.x = 0.0;
-            preview.velocity.x = std::abs(preview.velocity.x);
-        } else if (preview.box.x + preview.box.w > pMonitor->m_size.x) {
-            preview.box.x = pMonitor->m_size.x - preview.box.w;
-            preview.velocity.x = -std::abs(preview.velocity.x);
-        }
-
-        if (preview.box.y < 0.0) {
-            preview.box.y = 0.0;
-            preview.velocity.y = std::abs(preview.velocity.y);
-        } else if (preview.box.y + preview.box.h > pMonitor->m_size.y) {
-            preview.box.y = pMonitor->m_size.y - preview.box.h;
-            preview.velocity.y = -std::abs(preview.velocity.y);
-        }
-    }
-
-    void resolveCollisions() {
-        for (int pass = 0; pass < 4; ++pass) {
-            bool changed = false;
-
-            for (size_t i = 0; i < previews.size(); ++i) {
-                for (size_t j = i + 1; j < previews.size(); ++j) {
-                    if (!boxesOverlap(previews[i].box, previews[j].box))
-                        continue;
-
-                    resolveCollision(previews[i], previews[j]);
-                    changed = true;
-                }
-            }
-
-            if (!changed)
-                break;
-        }
-    }
-
-    void resolveCollision(SPreview &a, SPreview &b) const {
-        const double overlapX =
-            std::min(a.box.x + a.box.w, b.box.x + b.box.w) - std::max(a.box.x, b.box.x);
-        const double overlapY =
-            std::min(a.box.y + a.box.h, b.box.y + b.box.h) - std::max(a.box.y, b.box.y);
-
-        if (overlapX <= overlapY) {
-            const double direction =
-                (a.box.x + a.box.w / 2.0 <= b.box.x + b.box.w / 2.0) ? -1.0 : 1.0;
-            const double aSpeed = std::max(20.0, std::abs(a.velocity.x));
-            const double bSpeed = std::max(20.0, std::abs(b.velocity.x));
-            const double push = overlapX / 2.0 + 1.0;
-
-            a.box.x += direction * push;
-            b.box.x -= direction * push;
-            a.velocity.x = direction * bSpeed;
-            b.velocity.x = -direction * aSpeed;
-        } else {
-            const double direction =
-                (a.box.y + a.box.h / 2.0 <= b.box.y + b.box.h / 2.0) ? -1.0 : 1.0;
-            const double aSpeed = std::max(20.0, std::abs(a.velocity.y));
-            const double bSpeed = std::max(20.0, std::abs(b.velocity.y));
-            const double push = overlapY / 2.0 + 1.0;
-
-            a.box.y += direction * push;
-            b.box.y -= direction * push;
-            a.velocity.y = direction * bSpeed;
-            b.velocity.y = -direction * aSpeed;
-        }
-
-        clampBoxToBounds(a.box, pMonitor->m_size);
-        clampBoxToBounds(b.box, pMonitor->m_size);
-    }
-
     std::vector<SPreview> previews;
-    std::chrono::steady_clock::time_point lastFrame;
     std::chrono::steady_clock::time_point activatedAt;
+    size_t nextPreviewIndex = 0;
+    uint64_t pathGeneration = 1;
     CHyprSignalListener mouseMoveHook;
     CHyprSignalListener mouseButtonHook;
     CHyprSignalListener keyboardHook;
@@ -550,6 +702,7 @@ static SDispatchResult startSaver() {
     if (!monitor)
         return {.success = false, .error = "no focused monitor"};
 
+    g_dismissAfterActivity = false;
     g_pOledSaver = std::make_unique<COledSaver>(monitor);
     return {};
 }
@@ -723,14 +876,33 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                                "preview border color", 0x2246C7D8));
     mustAddConfigValue(makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:border_size",
                                                              "preview border size", 2));
-    mustAddConfigValue(makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:margin",
-                                                             "initial layout margin", 64));
-    mustAddConfigValue(makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:gap",
-                                                             "initial layout gap", 36));
     mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
-        "plugin:hyproledsaver:speed", "preview velocity in logical px/s", 85.0F));
-    mustAddConfigValue(makeShared<Config::Values::CFloatValue>("plugin:hyproledsaver:opacity",
-                                                               "preview texture opacity", 0.82F));
+        "plugin:hyproledsaver:opacity", "maximum preview texture opacity", 0.34F));
+    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+        "plugin:hyproledsaver:max_visible", "maximum simultaneously visible previews", 2));
+    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+        "plugin:hyproledsaver:target_window_area", "target fraction of monitor area per preview",
+        0.34F));
+    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+        "plugin:hyproledsaver:min_window_scale", "minimum scale relative to real window size",
+        0.55F));
+    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+        "plugin:hyproledsaver:max_window_scale", "maximum scale relative to real window size",
+        0.94F));
+    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+        "plugin:hyproledsaver:path_duration_ms_min", "minimum Bezier path duration", 35000));
+    mustAddConfigValue(makeShared<Config::Values::CIntValue>(
+        "plugin:hyproledsaver:path_duration_ms_max", "maximum Bezier path duration", 70000));
+    mustAddConfigValue(
+        makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:start_stagger_ms_min",
+                                              "minimum stagger between preview starts", 2500));
+    mustAddConfigValue(
+        makeShared<Config::Values::CIntValue>("plugin:hyproledsaver:start_stagger_ms_max",
+                                              "maximum stagger between preview starts", 9000));
+    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+        "plugin:hyproledsaver:curve_strength", "Bezier control-point bend strength", 0.28F));
+    mustAddConfigValue(makeShared<Config::Values::CFloatValue>(
+        "plugin:hyproledsaver:path_accel_power", "Bezier path acceleration power", 1.35F));
     mustAddConfigValue(makeShared<Config::Values::CIntValue>(
         "plugin:hyproledsaver:dismiss_on_activity", "dismiss when input activity is detected", 1));
     mustAddConfigValue(makeShared<Config::Values::CIntValue>(
